@@ -21,3 +21,14 @@ c/bench/
 *.safetensors
 stats*.txt
 *.log
+
+# script di ricerca stadio-0 (esperimenti locali, non parte del motore)
+/engine.py
+/run.py
+/validate_ref.py
+/s0_costmodel.py
+/s1_trace_hitrate.py
+/s2_research.py
+/quant_test.py
+/profile_run.py
+/sweep.py

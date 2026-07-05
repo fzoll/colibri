@@ -60,6 +60,52 @@ COLI_MODEL=/path/to/glm52_i4 ./coli chat
 
 Useful knobs (env or flags): `--topp 0.7` adaptive expert top-p (30–40% less disk), `--ngen N` max tokens, `STATS=f`/`PIN=f PIN_GB=g` record expert usage then pin the hottest in RAM, `THINK=1` enable GLM-5.2's reasoning block, `DRAFT=n` MTP draft depth, `TF=1` teacher-forcing validation.
 
+## Got a better machine? Try it — here's what to expect
+
+colibrì was built on deliberately humble hardware (12 cores, 25 GB RAM, NVMe behind a WSL2 VHDX that caps random reads at ~1 GB/s). **Every one of those constraints is a knob your machine can turn up.** The engine needs: Linux (or WSL2), gcc with OpenMP, AVX2, ≥16 GB RAM, and the ~370 GB int4 model on a local NVMe (ext4 — never a network/9p mount).
+
+**How to test it, in order:**
+
+```bash
+cd c && ./setup.sh                 # build + architecture self-test (expects 32/32)
+
+# 1) measure YOUR disk the way the engine uses it (parallel 19 MB random reads):
+gcc -O2 -fopenmp iobench.c -o iobench
+./iobench /path/to/glm52_i4/out-00069.safetensors 19 64 8 0   # buffered, 8 threads
+./iobench /path/to/glm52_i4/out-00069.safetensors 19 64 8 1   # O_DIRECT
+
+# 2) chat; watch the per-turn stats line (tok/s, expert hit-rate, RSS):
+COLI_MODEL=/path/to/glm52_i4 ./coli chat
+
+# 3) record expert usage, then pin the hottest experts in your spare RAM:
+STATS=stats.txt ./coli chat
+PIN=stats.txt PIN_GB=20 ./coli chat        # scale PIN_GB to your free RAM
+
+# 4) quality benchmarks (MMLU/HellaSwag/ARC):
+./coli bench
+```
+
+**Back-of-envelope predictions** (decode is disk-bound: a cold token costs ~11.4 GB of expert reads; MTP speculation roughly halves the effective cost; RAM turns cold reads into free cache hits):
+
+| machine | expected |
+|---|---|
+| this dev box (WSL2 VHDX, ~1 GB/s, 25 GB RAM) | ~0.05–0.1 tok/s cold — proven baseline |
+| native Linux, PCIe4 NVMe (~3–5 GB/s random), 32 GB | ~0.5–1 tok/s |
+| PCIe5 NVMe or 2×NVMe RAID0 (~8–12 GB/s), 64 GB (PIN ~40 GB of hot experts) | ~2–4 tok/s |
+| 128–256 GB RAM workstation (hot expert set mostly cached) | ~5–15 tok/s, matmul-bound — interactive |
+
+These are estimates, not measurements — if you run colibrì on serious hardware, **please open an issue with your numbers**: real datapoints from better machines are exactly what this project needs next.
+
+## Supporting the project
+
+colibrì is a one-person project, written and tested entirely on a 12-core laptop with 25 GB of RAM — the numbers above are the ceiling of what I can measure at home. If this project is useful or interesting to you and you'd like to support its development (better test hardware translates *directly* into a faster engine for everyone: real NVMe scaling data, bigger pinned caches, int2/int3 quality sweeps on real benchmarks), you can:
+
+- ⭐ star the repo and share it;
+- 🐛 open issues with benchmark numbers from your hardware;
+- 💬 reach out via GitHub issues if you'd like to sponsor development or donate hardware.
+
+Every contribution, from a datapoint to a disk, moves the ceiling.
+
 ## Repo layout
 
 ```
@@ -67,10 +113,10 @@ c/glm.c          the engine (GLM-5.2 forward, streaming MoE, MTP, serve mode)
 c/st.h           safetensors reader: pread + fadvise, no mmap (RSS stays flat)
 c/tok.h          byte-level BPE tokenizer in C
 c/coli           CLI: chat / run / bench / convert / info
+c/iobench.c      parallel disk microbenchmark (measures what the engine feels)
 c/convert_fp8_to_int4.py   disk-safe FP8 → int4 converter
 c/make_glm_oracle.py       tiny-random oracle generator for validation
 c/olmoe.c        stage-A engine (OLMoE), first validation target
-*.py             research scripts (cost model, trace analysis, py engine)
 ```
 
 ## Why "colibrì"
