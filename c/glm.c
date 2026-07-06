@@ -172,9 +172,91 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
             for(;i<I;i++){ uint8_t byte=w[i>>2]; int sh=(i&3)*2; a += xs[i]*(float)((int)((byte>>sh)&3)-2); }
             y[(int64_t)s*O+o]=a*sc; } }
 }
+/* ---- KERNEL INTERI (IDOT): attivazioni quantizzate a int8 per riga (absmax/127,
+ * stile Q8_0), prodotto scalare INTERO via maddubs/madd AVX2 — niente conversione
+ * f32 dei pesi nel ciclo caldo. ~2-3x sui matmul quantizzati; errore aggiunto ~0.3%
+ * RMS per matmul (attivazione int8), IDOT=0 torna al percorso f32 esatto. */
+static int g_idot=1;
+static inline float qrow_i8(const float *x, int8_t *q, int I){
+    float amax=0; for(int i=0;i<I;i++){ float a=fabsf(x[i]); if(a>amax)amax=a; }
+    float s=amax/127.f; if(s<1e-12f) s=1e-12f; float inv=1.f/s;
+    for(int i=0;i<I;i++) q[i]=(int8_t)lrintf(x[i]*inv);
+    return s;
+}
+#ifdef __AVX2__
+static inline int hsum256_i32(__m256i v){
+    __m128i lo=_mm256_castsi256_si128(v), hi=_mm256_extracti128_si256(v,1);
+    lo=_mm_add_epi32(lo,hi); lo=_mm_hadd_epi32(lo,lo); lo=_mm_hadd_epi32(lo,lo);
+    return _mm_cvtsi128_si32(lo);
+}
+#endif
+/* dot int8·int8: trucco del segno (|w| unsigned × x·sign(w) signed). Sicuro:
+ * coppie <= 128*127*2 = 32512 < 32767, accumulo s32 fino a I=16384. */
+static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
+    int32_t sum=0; int i=0;
+#ifdef __AVX2__
+    __m256i acc=_mm256_setzero_si256(); const __m256i ones=_mm256_set1_epi16(1);
+    for(;i+32<=I;i+=32){
+        __m256i wv=_mm256_loadu_si256((const __m256i*)(w+i));
+        __m256i xv=_mm256_loadu_si256((const __m256i*)(x+i));
+        __m256i p=_mm256_maddubs_epi16(_mm256_sign_epi8(wv,wv),_mm256_sign_epi8(xv,wv));
+        acc=_mm256_add_epi32(acc,_mm256_madd_epi16(p,ones));
+    }
+    sum=hsum256_i32(acc);
+#endif
+    for(;i<I;i++) sum+=(int32_t)w[i]*x[i];
+    return sum;
+}
+/* dot int4(packed)·int8: nibble -> int8 [-8,7] al volo, poi stesso trucco */
+static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
+    int32_t sum=0; int i=0;
+#ifdef __AVX2__
+    const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi8(8);
+    const __m256i ones=_mm256_set1_epi16(1);
+    __m256i acc=_mm256_setzero_si256();
+    for(;i+32<=I;i+=32){
+        __m128i by=_mm_loadu_si128((const __m128i*)(w4+(i>>1)));   /* 16 byte = 32 nibble */
+        __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+        __m128i n0=_mm_unpacklo_epi8(lo,hi), n1=_mm_unpackhi_epi8(lo,hi);   /* in ordine */
+        __m256i wv=_mm256_sub_epi8(_mm256_set_m128i(n1,n0),b8);
+        __m256i xv=_mm256_loadu_si256((const __m256i*)(x+i));
+        __m256i p=_mm256_maddubs_epi16(_mm256_sign_epi8(wv,wv),_mm256_sign_epi8(xv,wv));
+        acc=_mm256_add_epi32(acc,_mm256_madd_epi16(p,ones));
+    }
+    sum=hsum256_i32(acc);
+#endif
+    for(;i+1<I;i+=2){ uint8_t b=w4[i>>1]; sum+=((int)(b&0xF)-8)*x[i]+((int)(b>>4)-8)*x[i+1]; }
+    if(i<I){ uint8_t b=w4[i>>1]; sum+=((int)(b&0xF)-8)*x[i]; }
+    return sum;
+}
+static void matmul_q_idot(float *y, const int8_t *xq, const float *sx, const int8_t *q,
+                          const float *scale, int S, int I, int O){
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){ const int8_t *w=q+(int64_t)o*I; float sc=scale[o];
+        for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i8i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
+}
+static void matmul_i4_idot(float *y, const int8_t *xq, const float *sx, const uint8_t *q4,
+                           const float *scale, int S, int I, int O){
+    int rb=(I+1)/2;
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){ const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o];
+        for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i4i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
+}
+
 static void matmul_qt(float *y, const float *x, const QT *w, int S){
-    if(w->fmt==0) matmul(y,x,w->qf,S,w->I,w->O);
-    else if(w->fmt==1) matmul_q(y,x,w->q8,w->s,S,w->I,w->O);
+    if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
+    /* misurato (mmbench, 12 core): int8 IDOT vince sempre (1.4-2.5x); int4 IDOT vince
+     * solo con S>=2 (1.8x) e PERDE a S=1 (unpack+sign non ripagano su una riga) */
+    if(g_idot && (w->fmt==1 || (w->fmt==2 && S>=2))){
+        int I=w->I;
+        int8_t *xq=malloc((size_t)S*I); float sxb[64]; float *sx=S<=64?sxb:falloc(S);
+        for(int s=0;s<S;s++) sx[s]=qrow_i8(x+(int64_t)s*I, xq+(int64_t)s*I, I);
+        if(w->fmt==1) matmul_q_idot(y,xq,sx,w->q8,w->s,S,I,w->O);
+        else matmul_i4_idot(y,xq,sx,w->q4,w->s,S,I,w->O);
+        free(xq); if(sx!=sxb) free(sx);
+        return;
+    }
+    if(w->fmt==1) matmul_q(y,x,w->q8,w->s,S,w->I,w->O);
     else if(w->fmt==3) matmul_i2(y,x,w->q4,w->s,S,w->I,w->O);
     else matmul_i4(y,x,w->q4,w->s,S,w->I,w->O);
 }
@@ -1329,6 +1411,7 @@ int main(int argc, char **argv){
     g_spec = getenv("SPEC")?atoi(getenv("SPEC")):1;
     g_draft = getenv("DRAFT")?atoi(getenv("DRAFT")):-1;   /* -1 = auto: 3 se MTP, 0 senza */
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
+    g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
     g_temp = getenv("TEMP")?atof(getenv("TEMP")):-1;       /* -1 = auto (1.0 chat/testo, greedy altrove) */
     g_nuc  = getenv("NUCLEUS")?atof(getenv("NUCLEUS")):0.90f;  /* piu' stretto dell'ufficiale 0.95: la coda int4 e' rumore */
     if(getenv("SEED")) g_rng = (uint64_t)atoll(getenv("SEED"))*0x9E3779B97F4A7C15ULL+1;
