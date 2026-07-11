@@ -1394,7 +1394,7 @@ static void layers_forward(Model *m, const int *ids, float *x, int S, int pos_ba
         /* layer_scalar: multiply entire layer output (after PLE) */
         float ls=m->L[i].layer_scalar;
         if(ls!=1.0f) for(int64_t j=0;j<(int64_t)S*D;j++) x[j]*=ls;
-        if(dbg) fprintf(stderr,"[DBG] layer_%d out S=%d [0,:5]: %f %f %f %f %f\n",i,S,x[0],x[1],x[2],x[3],x[4]);
+        if(dbg && i==0) fprintf(stderr,"[DBG] layer_%d out S=%d [0,:5]: %f %f %f %f %f\n",i,S,x[0],x[1],x[2],x[3],x[4]);
     }
     free(nrm); free(tmp);
     if(ple) free(ple);
