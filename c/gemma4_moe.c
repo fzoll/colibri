@@ -1366,6 +1366,12 @@ static void layers_forward(Model *m, const int *ids, float *x, int S, int pos_ba
     if(dbg) fprintf(stderr,"[DBG] embed S=%d tok0[:5]: %f %f %f %f %f\n",S,x[0],x[1],x[2],x[3],x[4]);
     if(dbg && S>=2){ int D=c->hidden; fprintf(stderr,"[DBG] embed S=%d tok1[:5]: %f %f %f %f %f\n",S,x[D],x[D+1],x[D+2],x[D+3],x[D+4]); }
     float *ple=ple_compute(m, ids, x, S);
+    if(dbg && ple && c->ple_dim && S>=2){
+        int D2=c->hidden, P2=c->ple_dim;
+        fprintf(stderr,"[DBG] PLE tok1[0,:5]: %f %f %f %f %f\n",
+            ple[1*c->n_layers*P2], ple[1*c->n_layers*P2+1], ple[1*c->n_layers*P2+2],
+            ple[1*c->n_layers*P2+3], ple[1*c->n_layers*P2+4]);
+    }
     if(dbg && ple && c->ple_dim){
         int P=c->ple_dim;
         fprintf(stderr,"[DBG] PLE[0,0,:5]: %f %f %f %f %f\n",ple[0],ple[1],ple[2],ple[3],ple[4]);
