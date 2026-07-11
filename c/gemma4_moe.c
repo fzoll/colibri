@@ -108,7 +108,7 @@ static int64_t qt_bytes(const QT *t){
 typedef struct {
     float *in_ln, *post_ln;
     /* attention */
-    QT q_proj, k_proj, o_proj;   /* no separate v_proj: K=V */
+    QT q_proj, k_proj, v_proj, o_proj;
     float *q_norm, *k_norm;      /* per-head QK-norm weights */
     float layer_scalar;          /* per-layer learned residual scaling */
     /* dense mlp (layer 0 only) */
@@ -764,7 +764,11 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
         /* attention: Q, K (=V), O projections. No bias. */
         l->q_proj = qt_load(m,P("self_attn.q_proj.weight"), H*hd, D, dbits);
         l->k_proj = qt_load(m,P("self_attn.k_proj.weight"), Hkv*hd, D, dbits);
-        /* v_proj not loaded — K=V: v_proj uses same weight as k_proj */
+        /* v_proj: present for sliding layers, absent for global (K=V) */
+        if(st_has(&m->S, P("self_attn.v_proj.weight")))
+            l->v_proj = qt_load(m,P("self_attn.v_proj.weight"), Hkv*hd, D, dbits);
+        else
+            l->v_proj = l->k_proj;  /* K=V: share weight */
         l->o_proj = qt_load(m,P("self_attn.o_proj.weight"), D, H*hd, dbits);
 
         /* QK-norm weights (per-head, shape [head_dim]) */
@@ -825,7 +829,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     /* resident bytes */
     int64_t rb=qt_bytes(&m->embed);
     for(int i=0;i<c->n_layers;i++){ Layer *l=&m->L[i];
-        rb+=qt_bytes(&l->q_proj)+qt_bytes(&l->k_proj)+qt_bytes(&l->o_proj);
+        rb+=qt_bytes(&l->q_proj)+qt_bytes(&l->k_proj)+qt_bytes(&l->v_proj)+qt_bytes(&l->o_proj);
         if(!l->sparse) rb+=qt_bytes(&l->dense_gate)+qt_bytes(&l->dense_up)+qt_bytes(&l->dense_down);
     }
     m->resident_bytes=rb;
@@ -914,51 +918,58 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     float prf = ltype==LTYPE_GLOBAL ? c->global_partial_rotary : c->slide_partial_rotary;
     int rope_dim = (int)(hd * prf);
     int rep = H / Hkv;
-    float scale = 1.f / sqrtf((float)hd);
+    float scale = 1.0f; /* Gemma 4: QK-norm handles scaling, no explicit 1/sqrt(d) */
     int window = (ltype==LTYPE_SLIDING) ? c->sliding_window : 0; /* 0 = no window = full causal */
     double ta0=now_s();
 
     float *Q = falloc((int64_t)S * H * hd);
-    float *KVnew = falloc((int64_t)S * Hkv * hd);
+    float *Knew = falloc((int64_t)S * Hkv * hd);
+    float *Vnew = falloc((int64_t)S * Hkv * hd);
     float *ctx = falloc((int64_t)S * H * hd);
 
-    /* 1) Project Q, K (=V) */
+    /* 1) Project Q, K, V separately */
     matmul_qt(Q, x, &l->q_proj, S);
-    matmul_qt(KVnew, x, &l->k_proj, S);  /* K=V: same projection for both */
+    matmul_qt(Knew, x, &l->k_proj, S);
+    matmul_qt(Vnew, x, &l->v_proj, S);
 
     /* 2) QK-Norm: RMSNorm on each head of Q and K independently, with learned weights */
     for(int s=0;s<S;s++){
         for(int h=0;h<H;h++){
             float *qh = Q + (int64_t)(s*H+h)*hd;
-            /* apply per-head rmsnorm with q_norm weights */
             float tmp[512]; /* hd <= 512 */
             rmsnorm_unit(tmp, qh, hd, c->eps);
             for(int d=0;d<hd;d++) qh[d] = tmp[d] * l->q_norm[d];
         }
         for(int h=0;h<Hkv;h++){
-            float *kh = KVnew + (int64_t)(s*Hkv+h)*hd;
+            float *kh = Knew + (int64_t)(s*Hkv+h)*hd;
             float tmp[512];
             rmsnorm_unit(tmp, kh, hd, c->eps);
             for(int d=0;d<hd;d++) kh[d] = tmp[d] * l->k_norm[d];
         }
     }
 
-    /* 3) Apply partial RoPE */
+    /* 3) Apply partial RoPE to Q and K (NOT V), and v_norm (parameter-free RMSNorm on V) */
     for(int s=0;s<S;s++){
         int pos=pos_base+s;
         for(int h=0;h<H;h++)
             rope_half(Q + (int64_t)(s*H+h)*hd, pos, rope_dim, theta);
-        for(int h=0;h<Hkv;h++)
-            rope_half(KVnew + (int64_t)(s*Hkv+h)*hd, pos, rope_dim, theta);
+        for(int h=0;h<Hkv;h++){
+            rope_half(Knew + (int64_t)(s*Hkv+h)*hd, pos, rope_dim, theta);
+            /* v_norm: parameter-free RMSNorm on each V head */
+            float *vh = Vnew + (int64_t)(s*Hkv+h)*hd;
+            float tmp_v[512];
+            rmsnorm_unit(tmp_v, vh, hd, c->eps);
+            memcpy(vh, tmp_v, hd*sizeof(float));
+        }
     }
 
-    /* 4) Store K and V in cache (K=V, so both get the same values) */
+    /* 4) Store K and V in cache */
     for(int s=0;s<S;s++){
         int pos=pos_base+s;
         memcpy(m->Kc[layer] + (int64_t)pos*Hkv*hd,
-               KVnew + (int64_t)s*Hkv*hd, Hkv*hd*sizeof(float));
+               Knew + (int64_t)s*Hkv*hd, Hkv*hd*sizeof(float));
         memcpy(m->Vc[layer] + (int64_t)pos*Hkv*hd,
-               KVnew + (int64_t)s*Hkv*hd, Hkv*hd*sizeof(float));
+               Vnew + (int64_t)s*Hkv*hd, Hkv*hd*sizeof(float));
     }
 
     /* 5) Attention: Q @ K^T * scale, causal mask (+ sliding window if applicable), softmax, @ V */
@@ -997,7 +1008,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     /* 6) Output projection */
     matmul_qt(out, ctx, &l->o_proj, S);
 
-    free(Q); free(KVnew); free(ctx);
+    free(Q); free(Knew); free(Vnew); free(ctx);
     m->t_attn += now_s()-ta0;
 }
 
@@ -1189,7 +1200,11 @@ static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_b
     /* attention sub-layer: input_layernorm → attn → post_attention_layernorm → residual add */
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->in_ln, D, c->eps);
     attention(m,l,li,nrm,S,pos_base,tmp);
+    if(getenv("DEBUG") && S<=2 && li==0)
+        fprintf(stderr,"[DBG] L%d attn_out[:5]: %f %f %f %f %f\n",li,tmp[0],tmp[1],tmp[2],tmp[3],tmp[4]);
     for(int s=0;s<S;s++) rmsnorm(tmp+(int64_t)s*D, tmp+(int64_t)s*D, l->post_ln, D, c->eps);
+    if(getenv("DEBUG") && S<=2 && li==0)
+        fprintf(stderr,"[DBG] L%d post_attn_ln[:5]: %f %f %f %f %f\n",li,tmp[0],tmp[1],tmp[2],tmp[3],tmp[4]);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j] += tmp[j];
 
     if(g_pilot && S<=8 && li+1<c->n_layers && m->L[li+1].sparse) pilot_prefetch(m,li+1,x,S);
