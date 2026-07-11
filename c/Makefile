@@ -36,7 +36,9 @@ NVCC      ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?= native
 NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
 PYTHON    ?= python3
-CUDA_OBJ  =
+CUDA_OBJ   =
+METAL_OBJ  =
+VULKAN_OBJ =
 TEST_BINS = tests/test_json tests/test_st tests/test_tier
 ifeq ($(CUDA),1)
 ifeq ($(UNAME_S),Darwin)
@@ -47,10 +49,36 @@ LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lstdc++
 CUDA_OBJ  = backend_cuda.o
 endif
 
+# METAL=1 adds a Metal GPU backend for Apple Silicon. macOS only.
+METAL     ?= 0
+ifeq ($(METAL),1)
+ifneq ($(UNAME_S),Darwin)
+$(error METAL=1 is supported only on macOS)
+endif
+CFLAGS   += -DCOLI_METAL
+LDFLAGS  += -framework Metal -framework Foundation
+METAL_OBJ = backend_metal.o
+endif
+
+# VULKAN=1 adds a Vulkan compute backend. Works on Linux (discrete/integrated GPU)
+# and RPi 5 (VideoCore VII). Requires Vulkan SDK / libvulkan-dev.
+VULKAN    ?= 0
+ifeq ($(VULKAN),1)
+CFLAGS    += -DCOLI_VULKAN
+LDFLAGS   += -lvulkan
+VULKAN_OBJ = backend_vulkan.o
+endif
+
 all: glm
 
-glm: glm.c st.h json.h tok.h tok_unicode.h compat.h $(CUDA_OBJ)
-	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) -o glm $(LDFLAGS)
+glm: glm.c st.h json.h tok.h tok_unicode.h compat.h $(CUDA_OBJ) $(METAL_OBJ) $(VULKAN_OBJ)
+	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) $(METAL_OBJ) $(VULKAN_OBJ) -o glm $(LDFLAGS)
+
+backend_metal.o: backend_metal.m backend_metal.h
+	$(CC) $(CFLAGS) -c backend_metal.m -o $@
+
+backend_vulkan.o: backend_vulkan.c backend_vulkan.h
+	$(CC) $(CFLAGS) -c backend_vulkan.c -o $@
 
 backend_cuda.o: backend_cuda.cu backend_cuda.h
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
@@ -60,6 +88,21 @@ cuda-test: backend_cuda.cu backend_cuda.h tests/test_backend_cuda.cu
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	$(NVCC) $(NVCCFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test
 	./backend_cuda_test
+
+# Compile GLSL to SPIR-V (requires glslangValidator from Vulkan SDK).
+shaders/matmul.spv: shaders/matmul.comp
+	@command -v glslangValidator >/dev/null 2>&1 || { echo "glslangValidator not found: install Vulkan SDK" >&2; exit 1; }
+	glslangValidator -V shaders/matmul.comp -o shaders/matmul.spv
+
+metal-test: backend_metal.m backend_metal.h tests/test_backend_metal.m
+	$(CC) $(CFLAGS) -DCOLI_METAL tests/test_backend_metal.m backend_metal.m -o tests/test_backend_metal $(LDFLAGS) -framework Metal -framework Foundation
+	./tests/test_backend_metal
+
+gemma4: gemma4_moe.c st.h json.h tok.h tok_unicode.h compat.h $(CUDA_OBJ) $(METAL_OBJ) $(VULKAN_OBJ)
+	$(CC) $(CFLAGS) gemma4_moe.c $(CUDA_OBJ) $(METAL_OBJ) $(VULKAN_OBJ) -o gemma4 $(LDFLAGS)
+
+glm4: glm4_moe.c st.h json.h tok.h tok_unicode.h compat.h $(CUDA_OBJ) $(METAL_OBJ) $(VULKAN_OBJ)
+	$(CC) $(CFLAGS) glm4_moe.c $(CUDA_OBJ) $(METAL_OBJ) $(VULKAN_OBJ) -o glm4 $(LDFLAGS)
 
 olmoe: olmoe.c st.h json.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe $(LDFLAGS)
@@ -92,7 +135,7 @@ check:
 	$(MAKE) test
 
 clean:
-	rm -f olmoe glm backend_cuda.o backend_cuda_test $(TEST_BINS)
+	rm -f olmoe glm glm4 gemma4 backend_cuda.o backend_metal.o backend_vulkan.o backend_cuda_test tests/test_backend_metal $(TEST_BINS)
 	rm -rf tests/__pycache__
 
 .PHONY: all cuda-test portable test-c test-python test check clean

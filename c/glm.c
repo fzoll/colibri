@@ -36,6 +36,9 @@
 #include <omp.h>
 #include "backend_cuda.h"
 #endif
+#ifdef COLI_METAL
+#include "backend_metal.h"
+#endif
 #ifdef __AVX2__
 #include <immintrin.h>
 static inline float hsum256(__m256 v){            /* somma orizzontale di 8 float */
@@ -71,7 +74,13 @@ typedef struct {
 #ifdef COLI_CUDA
     ColiCudaTensor *cuda;
 #endif
+#ifdef COLI_METAL
+    ColiMetalTensor *metal;
+#endif
     int cuda_eligible, cuda_failed, cuda_device;  /* resident tensor, never a reused expert slot */
+#ifdef COLI_METAL
+    int metal_eligible, metal_failed;
+#endif
 } QT;
 static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
     int64_t n=(int64_t)t->O*t->I;
@@ -181,6 +190,24 @@ static int parse_cuda_devices(const char *list, int *out){
         if(!*p) return 0;
     }
     return n;
+}
+#endif
+#ifdef COLI_METAL
+static int g_metal_enabled;
+static double g_metal_expert_gb;
+static int g_metal_dense;
+static void qt_metal_reset(QT *t){
+    if(t->metal){ coli_metal_tensor_free(t->metal); t->metal=NULL; }
+    t->metal_failed=0;
+}
+static int qt_metal_upload(QT *t){
+    const void *weights = t->fmt==0 ? (const void*)t->qf
+                        : t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
+    return coli_metal_tensor_upload(&t->metal,weights,t->s,t->fmt,t->I,t->O);
+}
+static void metal_stats_print(void){
+    size_t n=0,b=0; coli_metal_stats(&n,&b);
+    fprintf(stderr,"[Metal] resident set: %zu tensor, %.2f GB\n",n,b/1e9);
 }
 #endif
 static double now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
@@ -468,6 +495,15 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){
             w->O,w->I,w->cuda_device);
     }
 #endif
+#ifdef COLI_METAL
+    if(g_metal_enabled && w->metal_eligible && !w->metal_failed){
+        const void *weights = w->fmt==0 ? (const void*)w->qf
+                            : w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
+        if(coli_metal_matmul(&w->metal,y,x,weights,w->s,w->fmt,S,w->I,w->O)) return;
+        w->metal_failed=1;
+        fprintf(stderr,"[Metal] tensor [%d,%d] disabilitato dopo errore; fallback CPU\n",w->O,w->I);
+    }
+#endif
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
     /* int8 IDOT vince sempre (1.4-2.5x). int4 IDOT: l'autore su AVX2 trovo' che a S=1
      * non ripaga (soglia S>=2); ma su ARM/SDOT il singolo token CONVIENE (vedi g_i4s /
@@ -696,6 +732,9 @@ static QT qt_load(Model *m, const char *name, int O, int I, int bits){
         g_cuda_dense_projected[slot]+=qt_bytes(&t);
     }
 #endif
+#ifdef COLI_METAL
+    if(g_metal_enabled&&g_metal_dense) t.metal_eligible=1;
+#endif
     return t;
 }
 static float *ld(Model *m, const char *name){   /* tensore 1D f32 residente (norme/bias) */
@@ -864,9 +903,10 @@ static void embed_row(Model *m, int tok, float *x){
  * THREAD-SAFE su slot distinti (pread posizionale, st_find read-only). */
 static void expert_load(Model *m, int layer, int eid, ESlot *s){
 #ifdef COLI_CUDA
-    /* A live REPIN may reuse a GPU-enabled pinned slot for a different expert.
-     * Keep its tier assignment, but invalidate the old device weights. */
     if(s->eid!=eid){ qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d); }
+#endif
+#ifdef COLI_METAL
+    if(s->eid!=eid){ qt_metal_reset(&s->g); qt_metal_reset(&s->u); qt_metal_reset(&s->d); }
 #endif
     Cfg *c=&m->c; int I=c->moe_inter, D=c->hidden, b=m->ebits;
     char nm[3][288]; const char *suf[3]={"gate_proj","up_proj","down_proj"};
@@ -1234,6 +1274,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
             if(!nr) continue;
 #ifdef COLI_CUDA
             if(g_cuda_enabled && e->g.cuda_eligible) m->gpu_expert_calls++;
+#endif
+#ifdef COLI_METAL
+            if(g_metal_enabled && e->g.metal_eligible) m->gpu_expert_calls++;
 #endif
             for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)rows[r]*D, D*sizeof(float));
             double t0=now_s();
@@ -1733,6 +1776,9 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
         m->gpu_expert_count,m->gpu_expert_bytes/1e9,(unsigned long long)m->gpu_expert_calls);
     if(g_cuda_enabled) cuda_stats_print();
 #endif
+#ifdef COLI_METAL
+    if(g_metal_enabled) metal_stats_print();
+#endif
 }
 
 /* generazione reale: tokenizza PROMPT, prefill + decode greedy con stop su EOS,
@@ -1769,6 +1815,9 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     if(m->gpu_expert_count) printf("CUDA expert tier: %d residenti (%.2f GB) | %llu chiamate servite da VRAM\n",
         m->gpu_expert_count,m->gpu_expert_bytes/1e9,(unsigned long long)m->gpu_expert_calls);
     if(g_cuda_enabled) cuda_stats_print();
+#endif
+#ifdef COLI_METAL
+    if(g_metal_enabled) metal_stats_print();
 #endif
     profile_print(m,dt);
     if(g_looka){
@@ -1830,6 +1879,12 @@ static void repin_pass(Model *m){
                              +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
                              +(int64_t)coli_cuda_tensor_bytes(s->d.cuda) : 0;
 #endif
+#ifdef COLI_METAL
+        int mgpu=s->g.metal_eligible;
+        int64_t old_mgpu=mgpu ? (int64_t)coli_metal_tensor_bytes(s->g.metal)
+                               +(int64_t)coli_metal_tensor_bytes(s->u.metal)
+                               +(int64_t)coli_metal_tensor_bytes(s->d.metal) : 0;
+#endif
         double t0=now_s();
         expert_load(m,cd[b].l,cd[b].eid,s);       /* disk -> RAM, same resident slot */
         const char *tier="RAM";
@@ -1845,6 +1900,21 @@ static void repin_pass(Model *m){
                 s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
                 m->gpu_expert_count--; m->gpu_expert_bytes-=old_gpu;
                 fprintf(stderr,"[REPIN] upload VRAM fallito; slot degradato a RAM\n");
+            }
+        }
+#endif
+#ifdef COLI_METAL
+        if(mgpu){
+            if(qt_metal_upload(&s->g) && qt_metal_upload(&s->u) && qt_metal_upload(&s->d)){
+                int64_t now_mgpu=(int64_t)coli_metal_tensor_bytes(s->g.metal)
+                                +(int64_t)coli_metal_tensor_bytes(s->u.metal)
+                                +(int64_t)coli_metal_tensor_bytes(s->d.metal);
+                m->gpu_expert_bytes+=now_mgpu-old_mgpu; tier="GPU";
+            } else {
+                qt_metal_reset(&s->g); qt_metal_reset(&s->u); qt_metal_reset(&s->d);
+                s->g.metal_eligible=s->u.metal_eligible=s->d.metal_eligible=0;
+                m->gpu_expert_count--; m->gpu_expert_bytes-=old_mgpu;
+                fprintf(stderr,"[REPIN] Metal upload fallito; slot degradato a RAM\n");
             }
         }
 #endif
@@ -2276,6 +2346,38 @@ static void pin_load(Model *m, const char *statspath, double gb){
             g_cuda_devices[i],placed_n[i],placed_b[i]/1e9);
     }
 #endif
+#ifdef COLI_METAL
+    if(g_metal_enabled && g_metal_expert_gb>0){
+        double budget=g_metal_expert_gb*1e9;
+        size_t free_b=0,total_b=0;
+        if(coli_metal_mem_info(&free_b,&total_b)){
+            double safe=(double)free_b-2e9;
+            if(safe<0) safe=0;
+            if(budget>safe) budget=safe;
+        }
+        for(int a=0;a<npin && m->gpu_expert_bytes<budget;a++){
+            int li=r[a].l;
+            for(int z=0;z<m->npin[li];z++) if(m->pin[li][z].eid==r[a].e){
+                ESlot *s=&m->pin[li][z];
+                int64_t need=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
+                if(m->gpu_expert_bytes+need>budget) break;
+                s->g.metal_eligible=s->u.metal_eligible=s->d.metal_eligible=1;
+                if(qt_metal_upload(&s->g) && qt_metal_upload(&s->u) && qt_metal_upload(&s->d)){
+                    int64_t actual=(int64_t)coli_metal_tensor_bytes(s->g.metal)
+                                  +(int64_t)coli_metal_tensor_bytes(s->u.metal)
+                                  +(int64_t)coli_metal_tensor_bytes(s->d.metal);
+                    m->gpu_expert_count++; m->gpu_expert_bytes+=actual;
+                } else {
+                    qt_metal_reset(&s->g); qt_metal_reset(&s->u); qt_metal_reset(&s->d);
+                    s->g.metal_eligible=s->u.metal_eligible=s->d.metal_eligible=0;
+                }
+                break;
+            }
+        }
+        fprintf(stderr,"[Metal] hot expert tier: %d/%d expert, %.2f GB (budget %.1f GB)\n",
+            m->gpu_expert_count,npin,m->gpu_expert_bytes/1e9,g_metal_expert_gb);
+    }
+#endif
     pin_wire(m);                                   /* inchioda in RAM (no compressione) / wire in RAM (no compression) */
     free(r); free(cnt_l);
 }
@@ -2439,6 +2541,24 @@ int main(int argc, char **argv){
         return 2;
     }
 #endif
+#ifdef COLI_METAL
+    if(getenv("COLI_METAL") && atoi(getenv("COLI_METAL"))){
+        g_metal_enabled=coli_metal_init();
+        if(!g_metal_enabled){ fprintf(stderr,"[Metal] backend richiesto ma non disponibile\n"); return 2; }
+    }
+    g_metal_dense=getenv("METAL_DENSE")?atoi(getenv("METAL_DENSE")):1;
+    g_metal_expert_gb=getenv("METAL_EXPERT_GB")?atof(getenv("METAL_EXPERT_GB")):0;
+    if(g_metal_dense&&!g_metal_enabled&&getenv("METAL_DENSE")){ fprintf(stderr,"METAL_DENSE richiede COLI_METAL=1\n"); return 2; }
+    if(g_metal_expert_gb>0&&!g_metal_enabled){ fprintf(stderr,"METAL_EXPERT_GB richiede COLI_METAL=1\n"); return 2; }
+    if(g_metal_enabled) fprintf(stderr,"[Metal] mode: %s\n",g_metal_dense?"resident dense + routed experts":"routed experts only");
+#else
+    if((getenv("COLI_METAL") && atoi(getenv("COLI_METAL"))) ||
+       (getenv("METAL_DENSE") && atoi(getenv("METAL_DENSE"))) ||
+       (getenv("METAL_EXPERT_GB") && atof(getenv("METAL_EXPERT_GB"))>0)){
+        fprintf(stderr,"Metal richiesto ma questo binario e' CPU-only; ricompila con: make METAL=1\n");
+        return 2;
+    }
+#endif
     printf("== Motore C GLM (glm_moe_dsa), cache=%d expert/layer | expert@%d-bit densa@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
     g_mem_avail_boot = mem_available_gb();
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
@@ -2517,6 +2637,9 @@ int main(int argc, char **argv){
 #ifdef COLI_CUDA
         if(g_cuda_enabled) cuda_stats_print();
 #endif
+#ifdef COLI_METAL
+        if(g_metal_enabled) metal_stats_print();
+#endif
         return 0;
     }
     int *out=malloc((np+n_new)*sizeof(int));
@@ -2535,6 +2658,9 @@ int main(int argc, char **argv){
     if(m.gpu_expert_count) printf("CUDA expert tier: %d residenti (%.2f GB) | %llu chiamate servite da VRAM\n",
         m.gpu_expert_count,m.gpu_expert_bytes/1e9,(unsigned long long)m.gpu_expert_calls);
     if(g_cuda_enabled) cuda_stats_print();
+#endif
+#ifdef COLI_METAL
+    if(g_metal_enabled) metal_stats_print();
 #endif
     if(g_looka){
         const char *nm[3]={"token precedente (=SPEC prefetch)","ingresso layer, salto attention","layer successivo (1 giro di anticipo)"};
