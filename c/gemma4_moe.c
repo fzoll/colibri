@@ -1236,15 +1236,15 @@ static float *ple_compute(Model *m, const int *ids, const float *x, int S){
     float ctx_scale=1.f/sqrtf((float)D);
     for(int64_t i=0;i<(int64_t)S*NL*P;i++) ctx_ple[i]*=ctx_scale;
 
-    /* 3) Combine: (tok_ple + ctx_ple) / sqrt(2), then per-layer RMSNorm */
+    /* 3) RMSNorm on ctx_ple per-layer, THEN combine: (normed_ctx + tok_ple) / sqrt(2) */
     float inv_sqrt2=1.f/sqrtf(2.f);
     for(int s=0;s<S;s++){
         for(int l=0;l<NL;l++){
             float *out=ple+(int64_t)(s*NL+l)*P;
             float *tp=tok_ple+(int64_t)s*NL*P+(int64_t)l*P;
             float *cp=ctx_ple+(int64_t)s*NL*P+(int64_t)l*P;
-            for(int i=0;i<P;i++) out[i]=(tp[i]+cp[i])*inv_sqrt2;
-            rmsnorm(out, out, m->ple_proj_norm, P, c->eps);
+            rmsnorm(cp, cp, m->ple_proj_norm, P, c->eps);
+            for(int i=0;i<P;i++) out[i]=(cp[i]+tp[i])*inv_sqrt2;
         }
     }
     free(tok_ple); free(ctx_ple);
@@ -1277,7 +1277,14 @@ static void ple_apply(Model *m, Layer *l, const float *ple_layer, float *x, int 
 static void layers_forward(Model *m, const int *ids, float *x, int S, int pos_base){
     Cfg *c=&m->c; int D=c->hidden;
     /* Compute PLE for all layers at once (before entering the layer loop) */
+    int dbg=getenv("DEBUG")!=NULL;
+    if(dbg) fprintf(stderr,"[DBG] embed S=%d [0,:5]: %f %f %f %f %f\n",S,x[0],x[1],x[2],x[3],x[4]);
     float *ple=ple_compute(m, ids, x, S);
+    if(dbg && ple && c->ple_dim){
+        int P=c->ple_dim;
+        fprintf(stderr,"[DBG] PLE[0,0,:5]: %f %f %f %f %f\n",ple[0],ple[1],ple[2],ple[3],ple[4]);
+        fprintf(stderr,"[DBG] PLE[0,1,:5]: %f %f %f %f %f\n",ple[P],ple[P+1],ple[P+2],ple[P+3],ple[P+4]);
+    }
     float *nrm=falloc((int64_t)S*D), *tmp=falloc((int64_t)S*D);
     for(int i=0;i<c->n_layers;i++){
         if(S>=8 && (i%4==0 || i==c->n_layers-1))
@@ -1292,6 +1299,7 @@ static void layers_forward(Model *m, const int *ids, float *x, int S, int pos_ba
             free(ple_li);
         }
         layer_forward(m,&m->L[i],i,x,S,pos_base,nrm,tmp);
+        if(dbg) fprintf(stderr,"[DBG] layer_%d out S=%d [0,:5]: %f %f %f %f %f\n",i,S,x[0],x[1],x[2],x[3],x[4]);
     }
     free(nrm); free(tmp);
     if(ple) free(ple);
