@@ -117,7 +117,7 @@ typedef struct {
     float *pre_ff_ln, *post_ff_ln;
     /* MoE (layers 1-29) */
     float *router_proj;          /* [n_experts, hidden] */
-    float router_scale;          /* scalar */
+    float *router_scale_vec;     /* [hidden] — per-dim scaling for router input */
     float *per_expert_scale;     /* [n_experts] */
     /* fused expert tensor names (for pread slicing) */
     char gate_up_name[256];      /* model.language_model.layers.N.experts.gate_up_proj */
@@ -794,7 +794,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             l->dense_down = qt_load(m,P("mlp.down_proj.weight"), D, c->dense_inter, dbits);
             /* MoE: router */
             l->router_proj = ld(m,P("router.proj.weight")); /* [n_experts, hidden] */
-            { float *rs=ld(m,P("router.scale")); l->router_scale=rs[0]; free(rs); }
+            l->router_scale_vec = ld(m,P("router.scale")); /* [hidden] per-dim scale */
             l->per_expert_scale = ld(m,P("router.per_expert_scale")); /* [n_experts] */
             /* fused expert weight tensor names for pread slicing */
             snprintf(l->gate_up_name,sizeof(l->gate_up_name),
@@ -1016,29 +1016,31 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     m->t_attn += now_s()-ta0;
 }
 
-/* ---- MoE with Gemma 4 router (softmax + per_expert_scale) ---- */
+/* ---- MoE with Gemma 4 router ----
+ * HF: norm(x) * scale[D] * (1/sqrt(D)) → proj → softmax → topk → normalize → per_expert_scale */
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     Cfg *c=&m->c; int D=c->hidden, E=c->n_experts, K=c->topk, I=c->moe_inter;
-    float *logit=falloc(E), *scores=falloc(E);
+    float *logit=falloc(E), *normed=falloc(D);
     int *idxs=malloc((size_t)S*K*sizeof(int)); float *ws=malloc((size_t)S*K*sizeof(float));
     int *keff=malloc(S*sizeof(int));
+    float scalar_root = 1.f / sqrtf((float)D);
 
     for(int s=0;s<S;s++){
         const float *xs=x+(int64_t)s*D;
-        /* logits = x @ router_proj^T * router_scale */
-        matmul(logit, xs, l->router_proj, 1, D, E);
-        for(int e=0;e<E;e++) logit[e] *= l->router_scale;
-        /* softmax */
+        /* 1) RMSNorm (parameter-free) + scale[D] * scalar_root_size */
+        rmsnorm_unit(normed, xs, D, c->eps);
+        for(int d=0;d<D;d++) normed[d] *= l->router_scale_vec[d] * scalar_root;
+        /* 2) project to expert logits */
+        matmul(logit, normed, l->router_proj, 1, D, E);
+        /* 3) softmax */
         softmax(logit, E);
-        /* multiply by per_expert_scale */
-        for(int e=0;e<E;e++) scores[e] = logit[e] * l->per_expert_scale[e];
-        /* top-K selection */
+        /* 4) top-K selection from softmax probs */
         int *idx=idxs+(int64_t)s*K; float *w=ws+(int64_t)s*K;
         int Ksel = g_topk>0 ? (g_topk<K?g_topk:K) : K;
         for(int kk=0;kk<Ksel;kk++){ int best=-1; float bv=-1e30f;
             for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(idx[j]==e){tk=1;break;}
-                if(!tk && scores[e]>bv){bv=scores[e];best=e;} }
-            idx[kk]=best; w[kk]=scores[best];
+                if(!tk && logit[e]>bv){bv=logit[e];best=e;} }
+            idx[kk]=best; w[kk]=logit[best];
         }
         int Ke=Ksel;
         if(g_topp>0 && g_topp<1.f){
@@ -1052,8 +1054,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
             m->eusage[layer][idx[kk]]++;
             if(m->eheat[layer][idx[kk]]<UINT32_MAX) m->eheat[layer][idx[kk]]++;
         }
-        /* normalize weights for selected experts */
+        /* 5) normalize top-K weights to sum=1 */
         { float sm=0; for(int kk=0;kk<Ke;kk++) sm+=w[kk]; sm+=1e-20f; for(int kk=0;kk<Ke;kk++) w[kk]/=sm; }
+        /* 6) multiply by per_expert_scale */
+        for(int kk=0;kk<Ke;kk++) w[kk]*=l->per_expert_scale[idx[kk]];
         for(int d=0;d<D;d++) out[(int64_t)s*D+d]=0;
     }
     m->enr[layer]=keff[S-1]; for(int kk=0;kk<keff[S-1];kk++) m->eroute[layer][kk]=idxs[(int64_t)(S-1)*K+kk];
@@ -1122,7 +1126,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
               ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; dst->used=++m->eclock; }
         }
     }
-    free(logit); free(scores); free(idxs); free(ws); free(keff); free(uniq);
+    free(logit); free(normed); free(idxs); free(ws); free(keff); free(uniq);
     free(xg); free(gg); free(uu); free(hh); free(rows); free(rw);
 }
 
@@ -1159,9 +1163,8 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
     float *nrm=falloc(D), *ch=falloc(E);
     for(int s=0;s<S;s++){
         rmsnorm(nrm, x+(int64_t)s*D, l->post_ln, D, c->eps);
-        /* Gemma 4 router: matmul, scale, softmax, per_expert_scale */
+        /* Gemma 4 router (simplified for pilot — approximate, no norm/scale) */
         matmul(ch, nrm, l->router_proj, 1, D, E);
-        for(int e=0;e<E;e++) ch[e] *= l->router_scale;
         softmax(ch, E);
         for(int e=0;e<E;e++) ch[e] *= l->per_expert_scale[e];
         for(int kk=0;kk<K;kk++){
@@ -1249,8 +1252,13 @@ static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_b
         /* dense path: pre_ff_ln → mlp → post_ff_ln → residual add */
         for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->pre_ff_ln, D, c->eps);
         dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
-        if(l->post_ff_ln)
+        if(getenv("DEBUG") && S<=2 && li==0)
+            fprintf(stderr,"[DBG] L%d mlp_out[:5]: %f %f %f %f %f\n",li,tmp[0],tmp[1],tmp[2],tmp[3],tmp[4]);
+        if(l->post_ff_ln){
             for(int s=0;s<S;s++) rmsnorm(tmp+(int64_t)s*D, tmp+(int64_t)s*D, l->post_ff_ln, D, c->eps);
+            if(getenv("DEBUG") && S<=2 && li==0)
+                fprintf(stderr,"[DBG] L%d post_ff_ln[:5]: %f %f %f %f %f\n",li,tmp[0],tmp[1],tmp[2],tmp[3],tmp[4]);
+        }
         for(int64_t j=0;j<(int64_t)S*D;j++) x[j] += tmp[j];
     }
 
