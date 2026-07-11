@@ -588,14 +588,20 @@ static inline float gelu_tanh(float x){
 }
 
 /* RoPE: standard paired, on first rope_dim dimensions */
+/* Gemma 4 RoPE: "rotate_half" convention (NOT interleaved/paired).
+ * x_rot[i] = x[i]*cos[i] - x[i+half]*sin[i]
+ * x_rot[i+half] = x[i+half]*cos[i] + x[i]*sin[i]
+ * Only first rope_dim elements are rotated; rest passed through. */
 static void rope_half(float *v, int pos, int rope_dim, float theta){
     int half = rope_dim/2;
+    float tmp[512]; /* rope_dim <= 512 */
+    memcpy(tmp, v, rope_dim*sizeof(float));
     for(int j=0;j<half;j++){
         float inv = powf(theta, -2.0f*j/rope_dim);
         float ang = pos*inv, cs=cosf(ang), sn=sinf(ang);
-        float a=v[2*j], b=v[2*j+1];
-        v[2*j]   = a*cs - b*sn;
-        v[2*j+1] = b*cs + a*sn;
+        float a=tmp[j], b=tmp[j+half];
+        v[j]      = a*cs - b*sn;
+        v[j+half] = b*cs + a*sn;
     }
 }
 
