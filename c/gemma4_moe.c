@@ -588,13 +588,16 @@ static inline float gelu_tanh(float x){
 }
 
 /* RoPE: standard paired, on first rope_dim dimensions */
-/* Gemma 4 RoPE: "rotate_half" convention (NOT interleaved/paired).
- * x_rot[i] = x[i]*cos[i] - x[i+half]*sin[i]
- * x_rot[i+half] = x[i+half]*cos[i] + x[i]*sin[i]
- * Only first rope_dim elements are rotated; rest passed through. */
+/* Gemma 4 RoPE: "rotate_half" convention.
+ * inv_freq has HALF dims (rope_dim/2 frequencies).
+ * cos/sin = [cos(inv_freq), cos(inv_freq)] — repeated, NOT 2x more freqs.
+ * out = x * cos + rotate_half(x) * sin
+ * rotate_half(x) = [-x[half:], x[:half]]
+ * So: out[j]      = x[j]*cos[j] - x[j+half]*sin[j]     (same freq j)
+ *     out[j+half] = x[j+half]*cos[j] + x[j]*sin[j]     (same freq j!) */
 static void rope_half(float *v, int pos, int rope_dim, float theta){
     int half = rope_dim/2;
-    float tmp[512]; /* rope_dim <= 512 */
+    float tmp[512];
     memcpy(tmp, v, rope_dim*sizeof(float));
     for(int j=0;j<half;j++){
         float inv = powf(theta, -2.0f*j/rope_dim);
@@ -1213,8 +1216,10 @@ static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_b
     /* attention sub-layer: input_layernorm → attn → post_attention_layernorm → residual add */
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->in_ln, D, c->eps);
     attention(m,l,li,nrm,S,pos_base,tmp);
-    if(getenv("DEBUG") && S<=2 && li==0)
-        fprintf(stderr,"[DBG] L%d attn_out[:5]: %f %f %f %f %f\n",li,tmp[0],tmp[1],tmp[2],tmp[3],tmp[4]);
+    if(getenv("DEBUG") && S<=2 && li==0){
+        fprintf(stderr,"[DBG] L%d attn tok0[:5]: %f %f %f %f %f\n",li,tmp[0],tmp[1],tmp[2],tmp[3],tmp[4]);
+        if(S>=2) fprintf(stderr,"[DBG] L%d attn tok1[:5]: %f %f %f %f %f\n",li,tmp[D],tmp[D+1],tmp[D+2],tmp[D+3],tmp[D+4]);
+    }
     for(int s=0;s<S;s++) rmsnorm(tmp+(int64_t)s*D, tmp+(int64_t)s*D, l->post_ln, D, c->eps);
     if(getenv("DEBUG") && S<=2 && li==0)
         fprintf(stderr,"[DBG] L%d post_attn_ln[:5]: %f %f %f %f %f\n",li,tmp[0],tmp[1],tmp[2],tmp[3],tmp[4]);
