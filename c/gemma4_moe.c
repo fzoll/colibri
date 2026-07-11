@@ -821,21 +821,32 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s){
     Cfg *c=&m->c; int I=c->moe_inter, D=c->hidden, b=m->ebits;
     Layer *l=&m->L[layer];
 
-    /* gate_up_proj: [n_experts, 2*I, D] — read expert eid's slice: offset = eid * 2*I*D elements */
+    /* Try per-expert pre-quantized format first (from convert_gemma4_to_int4.py),
+     * then fall back to fused BF16 tensor slicing. */
+    char nm[3][300]; const char *suf[3]={"gate_proj","up_proj","down_proj"};
+    int dims[3][2]={{I,D},{I,D},{D,I}};
+    for(int k=0;k<3;k++) snprintf(nm[k],sizeof(nm[k]),
+        "model.language_model.layers.%d.mlp.experts.%d.%s.weight",layer,eid,suf[k]);
+    char qn[320]; snprintf(qn,sizeof(qn),"%s.qs",nm[0]);
+    if(st_has(&m->S,qn)){
+        /* pre-quantized per-expert container */
+        qt_from_disk(m,nm[0],dims[0][0],dims[0][1],b,g_drop,&s->g);
+        qt_from_disk(m,nm[1],dims[1][0],dims[1][1],b,g_drop,&s->u);
+        qt_from_disk(m,nm[2],dims[2][0],dims[2][1],b,g_drop,&s->d);
+        s->eid=eid; return;
+    }
+
+    /* Fused BF16 fallback: gate_up_proj [n_experts, 2*I, D], down_proj [n_experts, D, I] */
     int64_t gu_elems = (int64_t)2*I*D;
     float *gu_buf = falloc(gu_elems);
     st_read_slice_f32(&m->S, l->gate_up_name, (int64_t)eid*gu_elems, gu_elems, gu_buf, g_drop);
+    float *gate_buf = gu_buf;
+    float *up_buf   = gu_buf + (int64_t)I*D;
 
-    /* split into gate[I,D] and up[I,D] — first I rows are gate, next I rows are up */
-    float *gate_buf = gu_buf;                /* [I, D] */
-    float *up_buf   = gu_buf + (int64_t)I*D; /* [I, D] */
-
-    /* down_proj: [n_experts, D, I] — read expert eid's slice */
     int64_t down_elems = (int64_t)D*I;
     float *down_buf = falloc(down_elems);
     st_read_slice_f32(&m->S, l->down_name, (int64_t)eid*down_elems, down_elems, down_buf, g_drop);
 
-    /* quantize into QT slots */
     if(!s->g.qf && !s->g.q8 && !s->g.q4) qt_alloc(&s->g, I, D, b);
     qt_fill(&s->g, gate_buf, b);
     if(!s->u.qf && !s->u.q8 && !s->u.q4) qt_alloc(&s->u, I, D, b);
