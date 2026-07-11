@@ -1168,46 +1168,70 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
     free(nrm); free(ch);
 }
 
-/* ---- forward di UN layer ---- */
+/* ---- forward di UN layer ----
+ * HF Gemma4 layer forward order:
+ *   residual = x
+ *   x = input_layernorm(x) → self_attn → post_attention_layernorm
+ *   x = residual + x
+ *   residual = x
+ *   x = pre_feedforward_layernorm(x) → mlp/moe
+ *   [MoE: combine mlp_out + moe_out with extra norms]
+ *   x = post_feedforward_layernorm(x)
+ *   x = residual + x
+ *   [PLE: gate → gelu → *ple → project → norm → residual add]
+ *   x *= layer_scalar
+ */
 static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_base, float *nrm, float *tmp){
     Cfg *c=&m->c; int D=c->hidden;
     if(g_spec && g_prefetch && l->sparse && m->enr[li]>0)
         for(int z=0;z<m->enr[li];z++) expert_prefetch(m,li,m->eroute[li][z]);
 
-    /* attention sub-layer */
+    /* attention sub-layer: input_layernorm → attn → post_attention_layernorm → residual add */
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->in_ln, D, c->eps);
     attention(m,l,li,nrm,S,pos_base,tmp);
-    /* residual with layer_scalar */
-    for(int64_t j=0;j<(int64_t)S*D;j++) x[j] += l->layer_scalar * tmp[j];
+    for(int s=0;s<S;s++) rmsnorm(tmp+(int64_t)s*D, tmp+(int64_t)s*D, l->post_ln, D, c->eps);
+    for(int64_t j=0;j<(int64_t)S*D;j++) x[j] += tmp[j];
 
     if(g_pilot && S<=8 && li+1<c->n_layers && m->L[li+1].sparse) pilot_prefetch(m,li+1,x,S);
 
     /* FFN sub-layer */
     if(l->sparse){
-        /* MoE path with extra layernorms */
+        /* MoE path: HF does mlp + moe separately, combines with norms.
+         * dense MLP (shared expert path): pre_ff_ln → mlp → post_ff_ln_1
+         * MoE expert path: pre_ff_ln_2(residual) → experts → post_ff_ln_2
+         * combined = mlp_normed + moe_normed, then post_ff_ln, then residual add */
+        float *mlp_out=falloc((int64_t)S*D);
         for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->pre_ff_ln, D, c->eps);
-        moe(m,l,li,nrm,S,tmp);
+        dense_mlp(l,nrm,S,D,c->moe_inter,mlp_out); /* shared expert uses moe_inter not dense_inter */
+        /* wait — Gemma 4 layer 0 is pure dense, no MoE. Layers 1-29 have MoE.
+         * But the HF forward shows BOTH mlp AND experts in MoE layers.
+         * Actually: l->mlp IS the shared expert in MoE layers. */
+        if(l->post_ff_ln_1)
+            for(int s=0;s<S;s++) rmsnorm(mlp_out+(int64_t)s*D, mlp_out+(int64_t)s*D, l->post_ff_ln_1, D, c->eps);
+        /* MoE expert path */
+        float *moe_out=falloc((int64_t)S*D);
+        if(l->pre_ff_ln_2)
+            for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->pre_ff_ln_2, D, c->eps);
+        moe(m,l,li,nrm,S,moe_out);
+        if(l->post_ff_ln_2)
+            for(int s=0;s<S;s++) rmsnorm(moe_out+(int64_t)s*D, moe_out+(int64_t)s*D, l->post_ff_ln_2, D, c->eps);
+        /* combine: tmp = mlp_out + moe_out */
+        for(int64_t j=0;j<(int64_t)S*D;j++) tmp[j]=mlp_out[j]+moe_out[j];
+        free(mlp_out); free(moe_out);
+        /* final post_feedforward_layernorm and residual add */
         if(l->post_ff_ln)
-            for(int s=0;s<S;s++){
-                float *ts=tmp+(int64_t)s*D;
-                float buf[4096]; /* D <= 2816 */
-                rmsnorm(buf, ts, l->post_ff_ln, D, c->eps);
-                memcpy(ts, buf, D*sizeof(float));
-            }
+            for(int s=0;s<S;s++) rmsnorm(tmp+(int64_t)s*D, tmp+(int64_t)s*D, l->post_ff_ln, D, c->eps);
+        for(int64_t j=0;j<(int64_t)S*D;j++) x[j] += tmp[j];
     } else {
-        /* dense path with pre/post feedforward layernorms */
+        /* dense path: pre_ff_ln → mlp → post_ff_ln → residual add */
         for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->pre_ff_ln, D, c->eps);
         dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
         if(l->post_ff_ln)
-            for(int s=0;s<S;s++){
-                float *ts=tmp+(int64_t)s*D;
-                float buf[4096];
-                rmsnorm(buf, ts, l->post_ff_ln, D, c->eps);
-                memcpy(ts, buf, D*sizeof(float));
-            }
+            for(int s=0;s<S;s++) rmsnorm(tmp+(int64_t)s*D, tmp+(int64_t)s*D, l->post_ff_ln, D, c->eps);
+        for(int64_t j=0;j<(int64_t)S*D;j++) x[j] += tmp[j];
     }
-    /* residual with layer_scalar */
-    for(int64_t j=0;j<(int64_t)S*D;j++) x[j] += l->layer_scalar * tmp[j];
+
+    /* layer_scalar applied in layers_forward, after PLE */
 }
 
 /* PLE: compute per-layer inputs from token IDs and hidden states.
@@ -1251,20 +1275,23 @@ static float *ple_compute(Model *m, const int *ids, const float *x, int S){
     return ple;
 }
 
-/* Apply PLE at layer entry: gate(hidden) * ple → project → norm → add */
+/* Apply PLE at layer END: gate(hidden) → GELU → * ple → project → norm → add
+ * HF order: per_layer_input_gate → act_fn → multiply ple → per_layer_projection → post_norm → residual add */
 static void ple_apply(Model *m, Layer *l, const float *ple_layer, float *x, int S){
     Cfg *c=&m->c; int D=c->hidden, P=c->ple_dim;
     if(!P || !ple_layer) return;
     float *gated=falloc((int64_t)S*P);
     float *proj=falloc((int64_t)S*D);
 
-    /* gate: [S,P] = [S,D] @ gate^T [P,D] — produces gating weights */
+    /* gate: [S,P] = [S,D] @ gate^T [P,D] */
     matmul_qt(gated, x, &l->ple_gate, S);
+    /* GELU activation on gate output */
+    for(int64_t i=0;i<(int64_t)S*P;i++) gated[i]=gelu_tanh(gated[i]);
     /* element-wise multiply: gated *= ple_layer */
     for(int64_t i=0;i<(int64_t)S*P;i++) gated[i]*=ple_layer[i];
     /* project back: [S,D] = [S,P] @ proj^T [D,P] */
     matmul_qt(proj, gated, &l->ple_proj, S);
-    /* post-norm and add to hidden state */
+    /* post-norm and add to hidden state (residual) */
     for(int s=0;s<S;s++){
         float *ps=proj+(int64_t)s*D;
         rmsnorm(ps, ps, l->ple_post_norm, D, c->eps);
@@ -1289,8 +1316,8 @@ static void layers_forward(Model *m, const int *ids, float *x, int S, int pos_ba
     for(int i=0;i<c->n_layers;i++){
         if(S>=8 && (i%4==0 || i==c->n_layers-1))
             fprintf(stderr,"[prefill] layer %d/%d · %d token\n", i+1, c->n_layers, S);
-        /* Apply PLE before the layer's attention.
-         * ple layout: [S, n_layers, ple_dim]. Extract layer i for all S tokens. */
+        layer_forward(m,&m->L[i],i,x,S,pos_base,nrm,tmp);
+        /* Apply PLE AFTER attention+FFN, then layer_scalar */
         if(ple && c->ple_dim){
             int P=c->ple_dim, NL=c->n_layers;
             float *ple_li=falloc((int64_t)S*P);
@@ -1298,7 +1325,9 @@ static void layers_forward(Model *m, const int *ids, float *x, int S, int pos_ba
             ple_apply(m, &m->L[i], ple_li, x, S);
             free(ple_li);
         }
-        layer_forward(m,&m->L[i],i,x,S,pos_base,nrm,tmp);
+        /* layer_scalar: multiply entire layer output (after PLE) */
+        float ls=m->L[i].layer_scalar;
+        if(ls!=1.0f) for(int64_t j=0;j<(int64_t)S*D;j++) x[j]*=ls;
         if(dbg) fprintf(stderr,"[DBG] layer_%d out S=%d [0,:5]: %f %f %f %f %f\n",i,S,x[0],x[1],x[2],x[3],x[4]);
     }
     free(nrm); free(tmp);
