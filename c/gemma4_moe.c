@@ -1271,14 +1271,25 @@ static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_b
             memcpy(expert_in, x, (int64_t)S*D*sizeof(float));
         moe(m,l,li,x,expert_in,S,moe_out);  /* route from raw x, compute from normalized */
         free(expert_in);
+        if(getenv("DEBUG") && li==0 && S<=2){
+            fprintf(stderr,"[DBG] L0 moe_out[:5]: %f %f %f %f %f\n",moe_out[0],moe_out[1],moe_out[2],moe_out[3],moe_out[4]);
+            fprintf(stderr,"[DBG] L0 mlp_normed[:5]: %f %f %f %f %f\n",mlp_out[0],mlp_out[1],mlp_out[2],mlp_out[3],mlp_out[4]);
+        }
+        /* post_ff_ln_2 on moe_out */
         if(l->post_ff_ln_2)
             for(int s=0;s<S;s++) rmsnorm(moe_out+(int64_t)s*D, moe_out+(int64_t)s*D, l->post_ff_ln_2, D, c->eps);
+        if(getenv("DEBUG") && li==0 && S<=2)
+            fprintf(stderr,"[DBG] L0 expert_normed[:5]: %f %f %f %f %f\n",moe_out[0],moe_out[1],moe_out[2],moe_out[3],moe_out[4]);
         /* combine: tmp = mlp_out + moe_out */
         for(int64_t j=0;j<(int64_t)S*D;j++) tmp[j]=mlp_out[j]+moe_out[j];
+        if(getenv("DEBUG") && li==0 && S<=2)
+            fprintf(stderr,"[DBG] L0 combined[:5]: %f %f %f %f %f\n",tmp[0],tmp[1],tmp[2],tmp[3],tmp[4]);
         free(mlp_out); free(moe_out);
         /* final post_feedforward_layernorm and residual add */
         if(l->post_ff_ln)
             for(int s=0;s<S;s++) rmsnorm(tmp+(int64_t)s*D, tmp+(int64_t)s*D, l->post_ff_ln, D, c->eps);
+        if(getenv("DEBUG") && li==0 && S<=2)
+            fprintf(stderr,"[DBG] L0 post_ff_ln[:5]: %f %f %f %f %f\n",tmp[0],tmp[1],tmp[2],tmp[3],tmp[4]);
         for(int64_t j=0;j<(int64_t)S*D;j++) x[j] += tmp[j];
     } else {
         /* dense path: pre_ff_ln → mlp → post_ff_ln → residual add */
