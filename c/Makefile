@@ -1,4 +1,5 @@
 UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
 
 ifeq ($(UNAME_S),Darwin)
 # --- macOS / Apple Silicon ---
@@ -16,6 +17,24 @@ OMPC    =
 OMPL    =
 endif
 CFLAGS  = -O3 $(OMPC) -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+LDFLAGS = -lm $(OMPL)
+else ifeq ($(UNAME_M),aarch64)
+# --- ARM Linux / aarch64 ---
+# Su aarch64 GCC il default e' armv8-a: NEON e' baseline, niente -march necessario
+# (i kernel __ARM_NEON / __ARM_FEATURE_DOTPROD si attivano da soli).
+# OpenMP e' opzionale: se libgomp c'e' lo usa, altrimenti build single-thread
+# (i pragma omp vengono ignorati). Come su macOS, ma senza il path Homebrew.
+CC      = gcc
+OMPOK  := $(shell $(CC) -fopenmp -E - </dev/null >/dev/null 2>&1 && echo 1)
+ifeq ($(OMPOK),1)
+OMPC    = -fopenmp
+OMPL    = -fopenmp
+else
+$(warning libgomp non trovato: build SINGLE-THREAD.)
+OMPC    =
+OMPL    =
+endif
+CFLAGS  = -O3 $(OMPC) -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -Wno-format-truncation
 LDFLAGS = -lm $(OMPL)
 else
 # --- Linux x86-64 (percorso originale, invariato) ---
