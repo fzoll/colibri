@@ -788,6 +788,10 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             l->pre_ff_ln  = ld(m,P("pre_feedforward_layernorm.weight"));
             l->post_ff_ln = ld(m,P("post_feedforward_layernorm.weight"));
         } else {
+            /* MoE layer ALSO has a shared MLP (same intermediate_size as dense) */
+            l->dense_gate = qt_load(m,P("mlp.gate_proj.weight"), c->dense_inter, D, dbits);
+            l->dense_up   = qt_load(m,P("mlp.up_proj.weight"),   c->dense_inter, D, dbits);
+            l->dense_down = qt_load(m,P("mlp.down_proj.weight"), D, c->dense_inter, dbits);
             /* MoE: router */
             l->router_proj = ld(m,P("router.proj.weight")); /* [n_experts, hidden] */
             { float *rs=ld(m,P("router.scale")); l->router_scale=rs[0]; free(rs); }
@@ -1217,7 +1221,7 @@ static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_b
          * combined = mlp_normed + moe_normed, then post_ff_ln, then residual add */
         float *mlp_out=falloc((int64_t)S*D);
         for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->pre_ff_ln, D, c->eps);
-        dense_mlp(l,nrm,S,D,c->moe_inter,mlp_out); /* shared expert uses moe_inter not dense_inter */
+        dense_mlp(l,nrm,S,D,c->dense_inter,mlp_out); /* shared MLP in MoE uses intermediate_size, not moe_intermediate_size */
         /* wait — Gemma 4 layer 0 is pure dense, no MoE. Layers 1-29 have MoE.
          * But the HF forward shows BOTH mlp AND experts in MoE layers.
          * Actually: l->mlp IS the shared expert in MoE layers. */
