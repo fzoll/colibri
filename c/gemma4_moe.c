@@ -940,6 +940,10 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     float *Vnew = falloc((int64_t)S * Hkv * hd);
     float *ctx = falloc((int64_t)S * H * hd);
 
+    { int D=c->hidden;
+    if(getenv("DEBUG") && layer==0 && S>=2)
+        fprintf(stderr,"[DBG] attn input tok1[:5]: %f %f %f %f %f\n",
+            x[D],x[D+1],x[D+2],x[D+3],x[D+4]); }
     /* 1) Project Q, K, V separately */
     matmul_qt(Q, x, &l->q_proj, S);
     matmul_qt(Knew, x, &l->k_proj, S);
@@ -1006,7 +1010,19 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             for(int d=0;d<hd;d++) a+=qh[d]*kt[d];
             sc[ti]=a*scale;
         }
+        if(getenv("DEBUG") && layer==0 && s==1 && h==0){
+            fprintf(stderr,"[DBG] Q tok1 h0[:5]: %f %f %f %f %f\n",qh[0],qh[1],qh[2],qh[3],qh[4]);
+            const float *k0=m->Kc[layer]+(int64_t)(0*Hkv+kv_h)*hd;
+            const float *k1=m->Kc[layer]+(int64_t)(1*Hkv+kv_h)*hd;
+            fprintf(stderr,"[DBG] K pos0 h0[:5]: %f %f %f %f %f\n",k0[0],k0[1],k0[2],k0[3],k0[4]);
+            fprintf(stderr,"[DBG] K pos1 h0[:5]: %f %f %f %f %f\n",k1[0],k1[1],k1[2],k1[3],k1[4]);
+        }
+        if(getenv("DEBUG") && layer==0 && s==1 && h==0)
+            fprintf(stderr,"[DBG] attn L0 tok1 h0: n=%d scores=[%f,%f] scale=%f\n",
+                n_attend, sc[0], n_attend>1?sc[1]:0.f, scale);
         softmax(sc, n_attend);
+        if(getenv("DEBUG") && layer==0 && s==1 && h==0)
+            fprintf(stderr,"[DBG] attn L0 tok1 h0: softmax=[%f,%f]\n", sc[0], n_attend>1?sc[1]:0.f);
         float *cx = ctx + (int64_t)(s*H+h)*hd;
         memset(cx, 0, hd*sizeof(float));
         for(int ti=0;ti<n_attend;ti++){
@@ -1347,7 +1363,8 @@ static void layers_forward(Model *m, const int *ids, float *x, int S, int pos_ba
     Cfg *c=&m->c; int D=c->hidden;
     /* Compute PLE for all layers at once (before entering the layer loop) */
     int dbg=getenv("DEBUG")!=NULL;
-    if(dbg) fprintf(stderr,"[DBG] embed S=%d [0,:5]: %f %f %f %f %f\n",S,x[0],x[1],x[2],x[3],x[4]);
+    if(dbg) fprintf(stderr,"[DBG] embed S=%d tok0[:5]: %f %f %f %f %f\n",S,x[0],x[1],x[2],x[3],x[4]);
+    if(dbg && S>=2){ int D=c->hidden; fprintf(stderr,"[DBG] embed S=%d tok1[:5]: %f %f %f %f %f\n",S,x[D],x[D+1],x[D+2],x[D+3],x[D+4]); }
     float *ple=ple_compute(m, ids, x, S);
     if(dbg && ple && c->ple_dim){
         int P=c->ple_dim;
@@ -1555,6 +1572,7 @@ static void forward_all(Model *m, const int *ids, int S, int *pred){
         if(c->logit_cap > 0){ float cap=c->logit_cap; for(int i=0;i<c->vocab;i++) lo[i]=cap*tanhf(lo[i]/cap); }
         int best=0; float bv=lo[0]; for(int i=1;i<c->vocab;i++) if(lo[i]>bv){bv=lo[i];best=i;}
         pred[s]=best;
+        if(getenv("DEBUG")) fprintf(stderr,"[TF] pos=%d pred=%d ref=%d %s\n",s,best,0,"");
         free(row);
     }
     free(x); free(lo);
