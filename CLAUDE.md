@@ -263,12 +263,14 @@ Compiles as `make gemma4`. Needs full implementation.
    - Flow: gate(hidden) * ple → project → norm → add to hidden, BEFORE attention
 
 3. **FIXED**: PLE applied at layer END (not start), GELU on gate, post_attention_layernorm, layer_scalar at end
-4. **REMAINING**: Layer 0 output diverges — attention implementation likely wrong. Debug attention next:
-   - RoPE convention: paired vs interleaved? partial_rotary on sliding vs global?
-   - QK-Norm: RMSNorm per-head on Q and K — verify dim/application
-   - K=V: same projection result stored as both K and V
-   - Softcapping on attention scores? (Gemma 3 had it, check Gemma 4)
-   - Verify: HF layer_0 out = [0.865, -0.259, 2.620, -0.191, -1.859] for single BOS token
+4. **REMAINING**: Multi-token attention tok1+ diverges. Debug next session:
+   - Single-token attention: EXACT MATCH (tok0 with causal mask = only self)
+   - Multi-token tok1 (sees tok0+tok1): DIVERGES from HF
+   - RoPE convention: rotate_half with repeated inv_freq — VERIFIED CORRECT
+   - Likely cause: attention scoring accumulation, or the V values at tok1 position
+   - Debug approach: add inline debug to attention() for tok1 scores/softmax/ctx
+   - HF L0 attn tok1[:5]: [-0.316, 0.143, 0.017, -0.245, 0.073]
+   - C  L0 attn tok1[:5]: [0.353, -0.568, -0.797, -0.445, -0.559]
 
 ## Remaining work
 
