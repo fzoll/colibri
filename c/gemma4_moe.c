@@ -787,8 +787,10 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
         /* layer scalar */
         { float *ls=ld(m,P("layer_scalar")); l->layer_scalar=ls[0]; free(ls); }
 
-        /* FFN: layer 0 is dense, layers 1-29 are MoE */
-        l->sparse = (i >= c->first_dense);
+        /* ALL layers have MoE. first_k_dense_replace means first N layers
+         * have BOTH dense MLP AND MoE experts. Layers >= first_dense have
+         * only MoE (no separate dense MLP). But enable_moe_block = true for ALL. */
+        l->sparse = 1;  /* ALL layers run MoE */
         if(!l->sparse){
             /* dense MLP */
             l->dense_gate = qt_load(m,P("mlp.gate_proj.weight"), c->dense_inter, D, dbits);
@@ -1341,18 +1343,24 @@ static void ple_apply(Model *m, Layer *l, const float *ple_layer, float *x, int 
     float *gated=falloc((int64_t)S*P);
     float *proj=falloc((int64_t)S*D);
 
+    int dbg_ple = getenv("DEBUG")!=NULL;
     /* gate: [S,P] = [S,D] @ gate^T [P,D] */
     matmul_qt(gated, x, &l->ple_gate, S);
+    if(dbg_ple) fprintf(stderr,"[PLE] gate[:5]: %f %f %f %f %f\n",gated[0],gated[1],gated[2],gated[3],gated[4]);
     /* GELU activation on gate output */
     for(int64_t i=0;i<(int64_t)S*P;i++) gated[i]=gelu_tanh(gated[i]);
+    if(dbg_ple) fprintf(stderr,"[PLE] gelu[:5]: %f %f %f %f %f\n",gated[0],gated[1],gated[2],gated[3],gated[4]);
     /* element-wise multiply: gated *= ple_layer */
     for(int64_t i=0;i<(int64_t)S*P;i++) gated[i]*=ple_layer[i];
+    if(dbg_ple) fprintf(stderr,"[PLE] g*ple[:5]: %f %f %f %f %f\n",gated[0],gated[1],gated[2],gated[3],gated[4]);
     /* project back: [S,D] = [S,P] @ proj^T [D,P] */
     matmul_qt(proj, gated, &l->ple_proj, S);
+    if(dbg_ple) fprintf(stderr,"[PLE] proj[:5]: %f %f %f %f %f\n",proj[0],proj[1],proj[2],proj[3],proj[4]);
     /* post-norm and add to hidden state (residual) */
     for(int s=0;s<S;s++){
         float *ps=proj+(int64_t)s*D;
         rmsnorm(ps, ps, l->ple_post_norm, D, c->eps);
+        if(dbg_ple && s==0) fprintf(stderr,"[PLE] norm[:5]: %f %f %f %f %f\n",ps[0],ps[1],ps[2],ps[3],ps[4]);
         float *xs=x+(int64_t)s*D;
         for(int d=0;d<D;d++) xs[d]+=ps[d];
     }
