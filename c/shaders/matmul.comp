@@ -1,0 +1,131 @@
+/*
+ * matmul.comp -- GLSL compute shader for quantized matrix-vector product.
+ *
+ * Mirrors the Metal/CUDA matmul kernels in Colibri:
+ *   y[S,O] = x[S,I] @ W[O,I]^T
+ *
+ * One workgroup per (output_row, sequence_token).
+ * 256 threads cooperatively reduce across the input dimension.
+ *
+ * Push constant `fmt` selects the weight format:
+ *   0 = f32   (4 bytes per weight)
+ *   1 = int8  (1 byte  per weight, per-row scale)
+ *   2 = int4  (nibble, 2 per byte, bias -8, per-row scale)
+ *   3 = int2  (2 bits, 4 per byte, bias -2, per-row scale)
+ *
+ * Regenerate SPIR-V:
+ *   glslangValidator -V shaders/matmul.comp -o shaders/matmul.spv
+ *   xxd -i shaders/matmul.spv > matmul_spv.h
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly  buffer XBuf { float x_data[]; };
+layout(set = 0, binding = 1) readonly  buffer WBuf { uint  w_data[]; };
+layout(set = 0, binding = 2) readonly  buffer SBuf { float s_data[]; };
+layout(set = 0, binding = 3) writeonly buffer YBuf { float y_data[]; };
+
+layout(push_constant) uniform Params {
+    int S;
+    int I;
+    int O;
+    int rb;   /* row bytes for this format */
+    int fmt;  /* 0=f32, 1=i8, 2=i4, 3=i2 */
+};
+
+shared float partial[256];
+
+/* ---- weight unpacking -------------------------------------------------- */
+
+/* Read a single byte from the weight buffer at byte offset `off`. */
+float read_byte_signed(int off) {
+    uint word = w_data[off >> 2];
+    uint shift = uint((off & 3) * 8);
+    int byte_val = int(bitfieldExtract(word, int(shift), 8));
+    if (byte_val >= 128) byte_val -= 256;
+    return float(byte_val);
+}
+
+float read_byte_unsigned(int off) {
+    uint word = w_data[off >> 2];
+    uint shift = uint((off & 3) * 8);
+    return float(bitfieldExtract(word, int(shift), 8));
+}
+
+float read_float(int float_idx) {
+    return uintBitsToFloat(w_data[float_idx]);
+}
+
+float weight_at_f32(int base_byte, int i) {
+    /* base_byte is o * rb = o * I * 4, so the float index is base_byte/4 + i */
+    return read_float((base_byte >> 2) + i);
+}
+
+float weight_at_i8(int base_byte, int i) {
+    return read_byte_signed(base_byte + i);
+}
+
+float weight_at_i4(int base_byte, int i) {
+    int byte_off = base_byte + (i >> 1);
+    uint word = w_data[byte_off >> 2];
+    uint shift = uint((byte_off & 3) * 8);
+    uint byte_val = bitfieldExtract(word, int(shift), 8);
+    int nibble;
+    if ((i & 1) != 0)
+        nibble = int(byte_val >> 4);
+    else
+        nibble = int(byte_val & 0xFu);
+    return float(nibble - 8);
+}
+
+float weight_at_i2(int base_byte, int i) {
+    int byte_off = base_byte + (i >> 2);
+    uint word = w_data[byte_off >> 2];
+    uint shift = uint((byte_off & 3) * 8);
+    uint byte_val = bitfieldExtract(word, int(shift), 8);
+    int bit_shift = (i & 3) * 2;
+    return float(int((byte_val >> bit_shift) & 3u) - 2);
+}
+
+/* ---- main -------------------------------------------------------------- */
+
+void main() {
+    int o   = int(gl_WorkGroupID.x);
+    int s   = int(gl_WorkGroupID.y);
+    uint tid = gl_LocalInvocationID.x;
+
+    int row_base = o * rb;
+    float sum = 0.0;
+
+    if (fmt == 0) {
+        for (int i = int(tid); i < I; i += 256)
+            sum += x_data[s * I + i] * weight_at_f32(row_base, i);
+    } else if (fmt == 1) {
+        for (int i = int(tid); i < I; i += 256)
+            sum += x_data[s * I + i] * weight_at_i8(row_base, i);
+    } else if (fmt == 2) {
+        for (int i = int(tid); i < I; i += 256)
+            sum += x_data[s * I + i] * weight_at_i4(row_base, i);
+    } else {
+        for (int i = int(tid); i < I; i += 256)
+            sum += x_data[s * I + i] * weight_at_i2(row_base, i);
+    }
+
+    partial[tid] = sum;
+    barrier();
+
+    /* Tree reduction */
+    for (uint n = 128u; n > 0u; n >>= 1u) {
+        if (tid < n)
+            partial[tid] += partial[tid + n];
+        barrier();
+    }
+
+    if (tid == 0u) {
+        float result = partial[0];
+        if (fmt != 0)
+            result *= s_data[o];
+        y_data[s * O + o] = result;
+    }
+}
