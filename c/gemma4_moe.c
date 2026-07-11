@@ -1045,7 +1045,9 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
 
 /* ---- MoE with Gemma 4 router ----
  * HF: norm(x) * scale[D] * (1/sqrt(D)) → proj → softmax → topk → normalize → per_expert_scale */
-static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
+/* route_x: raw residual for routing; expert_x: normalized input for expert FFN.
+ * HF: router(residual), experts(pre_ff_ln_2(residual)). */
+static void moe(Model *m, Layer *l, int layer, const float *route_x, const float *expert_x, int S, float *out){
     Cfg *c=&m->c; int D=c->hidden, E=c->n_experts, K=c->topk, I=c->moe_inter;
     float *logit=falloc(E), *normed=falloc(D);
     int *idxs=malloc((size_t)S*K*sizeof(int)); float *ws=malloc((size_t)S*K*sizeof(float));
@@ -1053,7 +1055,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     float scalar_root = 1.f / sqrtf((float)D);
 
     for(int s=0;s<S;s++){
-        const float *xs=x+(int64_t)s*D;
+        const float *xs=route_x+(int64_t)s*D;
         /* 1) RMSNorm (parameter-free) + scale[D] * scalar_root_size */
         rmsnorm_unit(normed, xs, D, c->eps);
         for(int d=0;d<D;d++) normed[d] *= l->router_scale_vec[d] * scalar_root;
@@ -1134,7 +1136,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
 #ifdef COLI_METAL
             if(g_metal_enabled && e->g.metal_eligible) m->gpu_expert_calls++;
 #endif
-            for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)rows[r]*D, D*sizeof(float));
+            for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, expert_x+(int64_t)rows[r]*D, D*sizeof(float));
             double t0=now_s();
             matmul_qt(gg, xg, &e->g, nr);
             matmul_qt(uu, xg, &e->u, nr);
@@ -1259,18 +1261,16 @@ static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_b
          * Actually: l->mlp IS the shared expert in MoE layers. */
         if(l->post_ff_ln_1)
             for(int s=0;s<S;s++) rmsnorm(mlp_out+(int64_t)s*D, mlp_out+(int64_t)s*D, l->post_ff_ln_1, D, c->eps);
-        /* MoE expert path: routing from RAW residual x, expert input from pre_ff_ln_2(x).
-         * HF: router(residual) for routing selection, pre_ff_ln_2(residual) for expert FFN input.
-         * We pass pre_ff_ln_2(x) to moe() — routing uses this as input (slightly different from
-         * HF which routes from raw x), but expert computation gets properly normalized input. */
+        /* MoE expert path: routing from RAW residual x, expert FFN from pre_ff_ln_2(x).
+         * HF: router(residual), experts(pre_feedforward_layernorm_2(residual)). */
         float *moe_out=falloc((int64_t)S*D);
-        float *moe_in=falloc((int64_t)S*D);
+        float *expert_in=falloc((int64_t)S*D);
         if(l->pre_ff_ln_2)
-            for(int s=0;s<S;s++) rmsnorm(moe_in+(int64_t)s*D, x+(int64_t)s*D, l->pre_ff_ln_2, D, c->eps);
+            for(int s=0;s<S;s++) rmsnorm(expert_in+(int64_t)s*D, x+(int64_t)s*D, l->pre_ff_ln_2, D, c->eps);
         else
-            memcpy(moe_in, x, (int64_t)S*D*sizeof(float));
-        moe(m,l,li,moe_in,S,moe_out);
-        free(moe_in);
+            memcpy(expert_in, x, (int64_t)S*D*sizeof(float));
+        moe(m,l,li,x,expert_in,S,moe_out);  /* route from raw x, compute from normalized */
+        free(expert_in);
         if(l->post_ff_ln_2)
             for(int s=0;s<S;s++) rmsnorm(moe_out+(int64_t)s*D, moe_out+(int64_t)s*D, l->post_ff_ln_2, D, c->eps);
         /* combine: tmp = mlp_out + moe_out */
