@@ -1354,6 +1354,7 @@ static void layers_forward(Model *m, const int *ids, float *x, int S, int pos_ba
         if(S>=8 && (i%4==0 || i==c->n_layers-1))
             fprintf(stderr,"[prefill] layer %d/%d · %d token\n", i+1, c->n_layers, S);
         layer_forward(m,&m->L[i],i,x,S,pos_base,nrm,tmp);
+        if(dbg && i==0) fprintf(stderr,"[DBG] pre-PLE L0 tok0[:5]: %f %f %f %f %f\n",x[0],x[1],x[2],x[3],x[4]);
         /* Apply PLE AFTER attention+FFN, then layer_scalar */
         if(ple && c->ple_dim){
             int P=c->ple_dim, NL=c->n_layers;
