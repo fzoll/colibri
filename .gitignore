@@ -16,6 +16,7 @@ c/backend_cuda.o
 c/backend_metal.o
 c/backend_cuda_test
 c/glm4
+c/gemma4
 c/tests/test_json
 c/tests/test_st
 c/tests/test_tier

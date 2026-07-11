@@ -587,22 +587,24 @@ static inline float gelu_tanh(float x){
     return 0.5f * x * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x * x * x)));
 }
 
-/* RoPE: standard paired, on first rope_dim dimensions */
-/* Gemma 4 RoPE: "rotate_half" convention.
- * inv_freq has HALF dims (rope_dim/2 frequencies).
- * cos/sin = [cos(inv_freq), cos(inv_freq)] — repeated, NOT 2x more freqs.
- * out = x * cos + rotate_half(x) * sin
- * rotate_half(x) = [-x[half:], x[:half]]
- * So: out[j]      = x[j]*cos[j] - x[j+half]*sin[j]     (same freq j)
- *     out[j+half] = x[j+half]*cos[j] + x[j]*sin[j]     (same freq j!) */
-static void rope_half(float *v, int pos, int rope_dim, float theta){
-    int half = rope_dim/2;
-    float tmp[512];
-    memcpy(tmp, v, rope_dim*sizeof(float));
-    for(int j=0;j<half;j++){
-        float inv = powf(theta, -2.0f*j/rope_dim);
+/* Gemma 4 "proportional" RoPE: "rotate_half" convention over the FULL head_dim,
+ * with only a prefix of the frequencies actually rotated when rope_dim < hd.
+ * HF (_compute_proportional_rope_parameters): inv_freq has hd/2 entries, computed
+ * against the FULL head_dim (not rope_dim); only the first rope_dim/2 entries are
+ * non-zero, the rest are frozen at angle 0 (identity). rotate_half always splits
+ * at hd/2, so a rotated pair is (j, j+hd/2) for j in [0, rope_dim/2) — NOT
+ * (j, j+rope_dim/2). Dims outside that prefix (on both halves) pass through
+ * unchanged. When rope_dim==hd (sliding layers) this reduces to the standard
+ * full-width rotate_half RoPE.
+ * out[j]      = x[j]*cos[j] - x[j+half]*sin[j]     (same freq j)
+ * out[j+half] = x[j+half]*cos[j] + x[j]*sin[j]     (same freq j!) */
+static void rope_half(float *v, int pos, int hd, int rope_dim, float theta){
+    int half = hd/2;
+    int active = rope_dim/2;
+    for(int j=0;j<active;j++){
+        float inv = powf(theta, -2.0f*j/hd);
         float ang = pos*inv, cs=cosf(ang), sn=sinf(ang);
-        float a=tmp[j], b=tmp[j+half];
+        float a=v[j], b=v[j+half];
         v[j]      = a*cs - b*sn;
         v[j+half] = b*cs + a*sn;
     }
@@ -971,9 +973,9 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     for(int s=0;s<S;s++){
         int pos=pos_base+s;
         for(int h=0;h<H;h++)
-            rope_half(Q + (int64_t)(s*H+h)*hd, pos, rope_dim, theta);
+            rope_half(Q + (int64_t)(s*H+h)*hd, pos, hd, rope_dim, theta);
         for(int h=0;h<Hkv;h++){
-            rope_half(Knew + (int64_t)(s*Hkv+h)*hd, pos, rope_dim, theta);
+            rope_half(Knew + (int64_t)(s*Hkv+h)*hd, pos, hd, rope_dim, theta);
             /* v_norm: parameter-free RMSNorm on each V head */
             float *vh = Vnew + (int64_t)(s*Hkv+h)*hd;
             float tmp_v[512];
