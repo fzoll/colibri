@@ -77,6 +77,8 @@ typedef struct {
     int stop_ids[8], n_stop;
     float eps, logit_cap;
     int *layer_type; /* [n_layers] -> LTYPE_SLIDING or LTYPE_GLOBAL */
+    int ple_dim;     /* hidden_size_per_layer_input (0 = no PLE) */
+    int ple_vocab;   /* vocab_size_per_layer_input */
 } Cfg;
 
 /* ---- Quantized tensor ---- */
@@ -124,6 +126,10 @@ typedef struct {
     float *pre_ff_ln_2;          /* pre_feedforward_layernorm_2 (if present) */
     float *post_ff_ln_1;         /* post_feedforward_layernorm_1 (shared expert) */
     float *post_ff_ln_2;         /* post_feedforward_layernorm_2 */
+    /* PLE (Per-Layer Embeddings) */
+    QT ple_gate;                 /* per_layer_input_gate [ple_dim, hidden] */
+    QT ple_proj;                 /* per_layer_projection [hidden, ple_dim] */
+    float *ple_post_norm;        /* post_per_layer_input_norm [hidden] */
 } Layer;
 
 /* ---- Expert slot ---- */
@@ -135,6 +141,10 @@ typedef struct {
     Cfg c; shards S;
     int ebits, dbits;
     QT embed; float *final_norm;
+    /* PLE global tensors */
+    QT ple_embed;                /* embed_tokens_per_layer [ple_vocab, n_layers*ple_dim] */
+    QT ple_model_proj;           /* per_layer_model_projection [n_layers*ple_dim, hidden] */
+    float *ple_proj_norm;        /* per_layer_projection_norm [ple_dim] */
     /* lm_head is tied to embed — pointer alias, no separate weight */
     Layer *L;
     /* KV cache: per-layer, but sizes differ for sliding vs global layers */
@@ -657,6 +667,19 @@ static void load_cfg(Cfg *c, const char *snap){
             }
         }
     }
+    /* PLE (Per-Layer Embeddings) */
+    c->ple_dim=gi(cfg,"hidden_size_per_layer_input");
+    c->ple_vocab=gi(cfg,"vocab_size_per_layer_input");
+    if(c->ple_dim && !c->ple_vocab) c->ple_vocab=c->vocab;
+    /* rope_parameters may override per-layer type */
+    jval *rp=json_get(cfg,"rope_parameters");
+    if(rp){
+        jval *sr=json_get(rp,"sliding_attention");
+        if(sr){ jval *t=json_get(sr,"rope_theta"); if(t) c->slide_rope_theta=(float)t->num; }
+        jval *gr=json_get(rp,"full_attention");
+        if(gr){ jval *t=json_get(gr,"rope_theta"); if(t) c->global_rope_theta=(float)t->num;
+                jval *p=json_get(gr,"partial_rotary_factor"); if(p) c->global_partial_rotary=(float)p->num; }
+    }
     /* validation */
     #define CKR(name,v,lo,hi) if((v)<(lo)||(v)>(hi)){ \
         fprintf(stderr,"config: %s=%d fuori range [%d,%d]\n",name,(int)(v),(int)(lo),(int)(hi)); exit(1); }
@@ -782,7 +805,22 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             m->eusage[i]=calloc(c->n_experts,sizeof(uint32_t));
             m->eheat[i]=calloc(c->n_experts,sizeof(uint32_t));
         }
+        /* PLE per-layer weights */
+        if(c->ple_dim){
+            l->ple_gate = qt_load(m,P("per_layer_input_gate.weight"), c->ple_dim, D, dbits);
+            l->ple_proj = qt_load(m,P("per_layer_projection.weight"), D, c->ple_dim, dbits);
+            l->ple_post_norm = ld(m,P("post_per_layer_input_norm.weight"));
+        }
         #undef P
+    }
+    /* PLE global weights */
+    if(c->ple_dim){
+        int NLP=c->n_layers*c->ple_dim;
+        m->ple_embed = qt_load(m,"model.language_model.embed_tokens_per_layer.weight",
+                               c->ple_vocab, NLP, io_bits);
+        m->ple_model_proj = qt_load(m,"model.language_model.per_layer_model_projection.weight",
+                                    NLP, D, dbits);
+        m->ple_proj_norm = ld(m,"model.language_model.per_layer_projection_norm.weight");
     }
     /* resident bytes */
     int64_t rb=qt_bytes(&m->embed);
@@ -1172,15 +1210,91 @@ static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_b
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j] += l->layer_scalar * tmp[j];
 }
 
-static void layers_forward(Model *m, float *x, int S, int pos_base){
+/* PLE: compute per-layer inputs from token IDs and hidden states.
+ * Returns [S, n_layers, ple_dim] or NULL if PLE not active. Caller frees. */
+static float *ple_compute(Model *m, const int *ids, const float *x, int S){
+    Cfg *c=&m->c;
+    if(!c->ple_dim) return NULL;
+    int P=c->ple_dim, NL=c->n_layers, D=c->hidden;
+    float *ple=falloc((int64_t)S*NL*P);
+
+    /* 1) Token-identity: lookup embed_tokens_per_layer[tok] → [n_layers*ple_dim], scaled by sqrt(ple_dim) */
+    float ple_scale=sqrtf((float)P);
+    float *tok_ple=falloc((int64_t)S*NL*P);
+    QT *pe=&m->ple_embed;
+    for(int s=0;s<S;s++){
+        int tok=ids[s]; float *dst=tok_ple+(int64_t)s*NL*P;
+        if(pe->fmt==0){ for(int i=0;i<NL*P;i++) dst[i]=pe->qf[(int64_t)tok*NL*P+i]*ple_scale; }
+        else if(pe->fmt==1){ const int8_t *q=pe->q8+(int64_t)tok*NL*P; float sc=pe->s[tok]*ple_scale;
+            for(int i=0;i<NL*P;i++) dst[i]=(float)q[i]*sc; }
+        else { for(int i=0;i<NL*P;i++) dst[i]=0; } /* fallback */
+    }
+
+    /* 2) Context projection: x @ per_layer_model_projection^T → [S, n_layers*ple_dim], scaled by 1/sqrt(hidden) */
+    float *ctx_ple=falloc((int64_t)S*NL*P);
+    matmul_qt(ctx_ple, x, &m->ple_model_proj, S);
+    float ctx_scale=1.f/sqrtf((float)D);
+    for(int64_t i=0;i<(int64_t)S*NL*P;i++) ctx_ple[i]*=ctx_scale;
+
+    /* 3) Combine: (tok_ple + ctx_ple) / sqrt(2), then per-layer RMSNorm */
+    float inv_sqrt2=1.f/sqrtf(2.f);
+    for(int s=0;s<S;s++){
+        for(int l=0;l<NL;l++){
+            float *out=ple+(int64_t)(s*NL+l)*P;
+            float *tp=tok_ple+(int64_t)s*NL*P+(int64_t)l*P;
+            float *cp=ctx_ple+(int64_t)s*NL*P+(int64_t)l*P;
+            for(int i=0;i<P;i++) out[i]=(tp[i]+cp[i])*inv_sqrt2;
+            rmsnorm(out, out, m->ple_proj_norm, P, c->eps);
+        }
+    }
+    free(tok_ple); free(ctx_ple);
+    return ple;
+}
+
+/* Apply PLE at layer entry: gate(hidden) * ple → project → norm → add */
+static void ple_apply(Model *m, Layer *l, const float *ple_layer, float *x, int S){
+    Cfg *c=&m->c; int D=c->hidden, P=c->ple_dim;
+    if(!P || !ple_layer) return;
+    float *gated=falloc((int64_t)S*P);
+    float *proj=falloc((int64_t)S*D);
+
+    /* gate: [S,P] = [S,D] @ gate^T [P,D] — produces gating weights */
+    matmul_qt(gated, x, &l->ple_gate, S);
+    /* element-wise multiply: gated *= ple_layer */
+    for(int64_t i=0;i<(int64_t)S*P;i++) gated[i]*=ple_layer[i];
+    /* project back: [S,D] = [S,P] @ proj^T [D,P] */
+    matmul_qt(proj, gated, &l->ple_proj, S);
+    /* post-norm and add to hidden state */
+    for(int s=0;s<S;s++){
+        float *ps=proj+(int64_t)s*D;
+        rmsnorm(ps, ps, l->ple_post_norm, D, c->eps);
+        float *xs=x+(int64_t)s*D;
+        for(int d=0;d<D;d++) xs[d]+=ps[d];
+    }
+    free(gated); free(proj);
+}
+
+static void layers_forward(Model *m, const int *ids, float *x, int S, int pos_base){
     Cfg *c=&m->c; int D=c->hidden;
+    /* Compute PLE for all layers at once (before entering the layer loop) */
+    float *ple=ple_compute(m, ids, x, S);
     float *nrm=falloc((int64_t)S*D), *tmp=falloc((int64_t)S*D);
     for(int i=0;i<c->n_layers;i++){
         if(S>=8 && (i%4==0 || i==c->n_layers-1))
             fprintf(stderr,"[prefill] layer %d/%d · %d token\n", i+1, c->n_layers, S);
+        /* Apply PLE before the layer's attention.
+         * ple layout: [S, n_layers, ple_dim]. Extract layer i for all S tokens. */
+        if(ple && c->ple_dim){
+            int P=c->ple_dim, NL=c->n_layers;
+            float *ple_li=falloc((int64_t)S*P);
+            for(int s=0;s<S;s++) memcpy(ple_li+(int64_t)s*P, ple+((int64_t)s*NL+i)*P, P*sizeof(float));
+            ple_apply(m, &m->L[i], ple_li, x, S);
+            free(ple_li);
+        }
         layer_forward(m,&m->L[i],i,x,S,pos_base,nrm,tmp);
     }
     free(nrm); free(tmp);
+    if(ple) free(ple);
 }
 
 /* ---- KV cache allocation (dual head_dim) ---- */
@@ -1204,7 +1318,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base){
     Cfg *c=&m->c; int D=c->hidden;
     float *x=falloc((int64_t)S*D);
     for(int s=0;s<S;s++) embed_row(m, ids[s], x+(int64_t)s*D);
-    layers_forward(m,x,S,pos_base);
+    layers_forward(m,ids,x,S,pos_base);
     float *last=falloc(D); rmsnorm(last, x+(int64_t)(S-1)*D, m->final_norm, D, c->eps);
     double th0=now_s();
     /* lm_head = embed transposed (tie_word_embeddings) */
@@ -1222,7 +1336,7 @@ static float *step_all(Model *m, const int *ids, int S, int pos_base){
     Cfg *c=&m->c; int D=c->hidden;
     float *x=falloc((int64_t)S*D);
     for(int s=0;s<S;s++) embed_row(m, ids[s], x+(int64_t)s*D);
-    layers_forward(m,x,S,pos_base);
+    layers_forward(m,ids,x,S,pos_base);
     float *lo=falloc((int64_t)S*c->vocab), *row=falloc(D);
     for(int s=0;s<S;s++){
         rmsnorm(row, x+(int64_t)s*D, m->final_norm, D, c->eps);
@@ -1353,7 +1467,7 @@ static void forward_all(Model *m, const int *ids, int S, int *pred){
     kv_alloc(m,S);
     float *x=falloc((int64_t)S*D);
     for(int s=0;s<S;s++) embed_row(m, ids[s], x+(int64_t)s*D);
-    layers_forward(m,x,S,0);
+    layers_forward(m,ids,x,S,0);
     float *lo=falloc(c->vocab);
     for(int s=0;s<S;s++){
         float *row=falloc(D); rmsnorm(row, x+(int64_t)s*D, m->final_norm, D, c->eps);
