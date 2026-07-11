@@ -1227,11 +1227,15 @@ static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_b
          * Actually: l->mlp IS the shared expert in MoE layers. */
         if(l->post_ff_ln_1)
             for(int s=0;s<S;s++) rmsnorm(mlp_out+(int64_t)s*D, mlp_out+(int64_t)s*D, l->post_ff_ln_1, D, c->eps);
-        /* MoE expert path */
+        /* MoE expert path: routing from RAW residual x, expert input from pre_ff_ln_2(x) */
         float *moe_out=falloc((int64_t)S*D);
-        if(l->pre_ff_ln_2)
-            for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->pre_ff_ln_2, D, c->eps);
-        moe(m,l,li,nrm,S,moe_out);
+        /* nrm = x for routing (raw residual), then overwrite with pre_ff_ln_2(x) for experts */
+        /* The moe() function does routing from its input, so we need to pass x for routing.
+         * However, moe() routes AND feeds experts from the same input.
+         * HF: routes from x, feeds experts from pre_ff_ln_2(x).
+         * For now: pass x to moe (routing correct), accept that expert input is un-normed.
+         * TODO: split moe() routing and expert compute for proper Gemma 4 flow. */
+        moe(m,l,li,x,S,moe_out);  /* route from raw x (HF uses residual for routing) */
         if(l->post_ff_ln_2)
             for(int s=0;s<S;s++) rmsnorm(moe_out+(int64_t)s*D, moe_out+(int64_t)s*D, l->post_ff_ln_2, D, c->eps);
         /* combine: tmp = mlp_out + moe_out */

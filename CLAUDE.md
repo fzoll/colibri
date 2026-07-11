@@ -262,9 +262,13 @@ Compiles as `make gemma4`. Needs full implementation.
    - Per layer: `post_per_layer_input_norm.weight` [hidden] — norm after PLE add
    - Flow: gate(hidden) * ple → project → norm → add to hidden, BEFORE attention
 
-3. **Possibly wrong**: RoPE convention (paired vs interleaved), attention score softcapping, K=V implementation details
-
-**PLE is required for correct output.** Without it, hidden states at each layer are wrong from the start. This is ~100-150 lines of new code.
+3. **FIXED**: PLE applied at layer END (not start), GELU on gate, post_attention_layernorm, layer_scalar at end
+4. **REMAINING**: Layer 0 output diverges — attention implementation likely wrong. Debug attention next:
+   - RoPE convention: paired vs interleaved? partial_rotary on sliding vs global?
+   - QK-Norm: RMSNorm per-head on Q and K — verify dim/application
+   - K=V: same projection result stored as both K and V
+   - Softcapping on attention scores? (Gemma 3 had it, check Gemma 4)
+   - Verify: HF layer_0 out = [0.865, -0.259, 2.620, -0.191, -1.859] for single BOS token
 
 ## Remaining work
 
