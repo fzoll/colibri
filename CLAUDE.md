@@ -248,6 +248,24 @@ Compiles as `make gemma4`. Needs full implementation.
 - Sampling, generation loop structure
 - Memory management
 
+## Gemma 4 debug status
+
+**Forward pass numerically incorrect.** Teacher-forcing: 2/20 match (FP32). Root causes found:
+
+1. **FIXED**: Embedding scaling by `sqrt(hidden_size)` (Gemma-specific) — added to `embed_row()`
+2. **NOT IMPLEMENTED**: PLE (Per-Layer Embeddings) — Gemma 4 has per-layer token identity embeddings that modify hidden states at each layer entry. This is a significant architectural feature:
+   - `embed_tokens_per_layer.weight` [vocab_per_layer, n_layers * ple_dim] — large lookup table
+   - `per_layer_model_projection.weight` [n_layers * ple_dim, hidden] — context projection
+   - `per_layer_projection_norm.weight` [ple_dim] — RMSNorm on projected PLE
+   - Per layer: `per_layer_input_gate.weight` [ple_dim, hidden] — gate the PLE
+   - Per layer: `per_layer_projection.weight` [hidden, ple_dim] — project back to hidden dim
+   - Per layer: `post_per_layer_input_norm.weight` [hidden] — norm after PLE add
+   - Flow: gate(hidden) * ple → project → norm → add to hidden, BEFORE attention
+
+3. **Possibly wrong**: RoPE convention (paired vs interleaved), attention score softcapping, K=V implementation details
+
+**PLE is required for correct output.** Without it, hidden states at each layer are wrong from the start. This is ~100-150 lines of new code.
+
 ## Remaining work
 
 1. **Metal backend unit test**: write `tests/test_backend_metal.m` — synthetic matmul correctness test (no model needed), similar to `tests/test_backend_cuda.cu`

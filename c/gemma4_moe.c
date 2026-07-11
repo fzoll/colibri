@@ -793,17 +793,18 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     m->resident_bytes=rb;
 }
 
-/* ---- embed ---- */
+/* ---- embed (Gemma scales embeddings by sqrt(hidden_size)) ---- */
 static void embed_row(Model *m, int tok, float *x){
     int D=m->c.hidden; QT *e=&m->embed;
-    if(e->fmt==0){ memcpy(x, e->qf+(int64_t)tok*D, D*sizeof(float)); return; }
-    if(e->fmt==1){ const int8_t *q=e->q8+(int64_t)tok*D; float s=e->s[tok];
+    float emb_scale=sqrtf((float)D);
+    if(e->fmt==0){ for(int i=0;i<D;i++) x[i]=e->qf[(int64_t)tok*D+i]*emb_scale; return; }
+    if(e->fmt==1){ const int8_t *q=e->q8+(int64_t)tok*D; float s=e->s[tok]*emb_scale;
         for(int i=0;i<D;i++) x[i]=(float)q[i]*s; return; }
-    if(e->fmt==2){ const uint8_t *q=e->q4+(int64_t)tok*((D+1)/2); float s=e->s[tok];
+    if(e->fmt==2){ const uint8_t *q=e->q4+(int64_t)tok*((D+1)/2); float s=e->s[tok]*emb_scale;
         for(int i=0;i<D;i+=2){ uint8_t byte=q[i>>1]; x[i]=(float)((int)(byte&0xF)-8)*s;
             if(i+1<D) x[i+1]=(float)((int)(byte>>4)-8)*s; }
         return; }
-    const uint8_t *q=e->q4+(int64_t)tok*((D+3)/4); float s=e->s[tok];
+    const uint8_t *q=e->q4+(int64_t)tok*((D+3)/4); float s=e->s[tok]*emb_scale;
     for(int i=0;i<D;i++){ uint8_t byte=q[i>>2]; int sh=(i&3)*2; x[i]=(float)((int)((byte>>sh)&3)-2)*s; }
 }
 
