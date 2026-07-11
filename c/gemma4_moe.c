@@ -1609,7 +1609,13 @@ static void forward_all(Model *m, const int *ids, int S, int *pred){
 static void generate(Model *m, const int *prompt, int np, int n_new, int *out){
     kv_alloc(m,np+n_new+g_draft+2);
     for(int i=0;i<np;i++) out[i]=prompt[i];
-    float *logit=step(m,prompt,np,0);
+    /* Prefill token-by-token (S=1) for numerical correctness.
+     * Batch prefill (S=np) has accumulated multi-token attention divergence. */
+    float *logit=NULL;
+    for(int i=0;i<np;i++){
+        if(logit) free(logit);
+        logit=step(m,&prompt[i],1,i);
+    }
     EmitStore es={out+np,0};
     spec_decode(m,out,np,n_new,-1,logit,emit_store,&es,NULL);
 }
