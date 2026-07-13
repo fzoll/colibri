@@ -58,13 +58,20 @@ function send() {
   if (sse) sse.close();
   sse = new EventSource('/stream?q=' + encodeURIComponent(msg));
   var text = '';
+  var dots = 0;
   sse.onmessage = function(e) {
     if (e.data === '[DONE]') {
       sse.close(); sse = null;
       document.getElementById('btn').disabled = false;
       return;
     }
-    text += e.data;
+    if (e.data === '.') {
+      dots++;
+      botDiv.innerHTML = '<span class="typing">generating' + '.'.repeat(dots % 4) + '</span>';
+      chat.scrollTop = chat.scrollHeight;
+      return;
+    }
+    text += e.data.replaceAll('␊', '\\n');
     botDiv.textContent = text;
     chat.scrollTop = chat.scrollHeight;
   };
@@ -125,16 +132,41 @@ class Handler(BaseHTTPRequestHandler):
         cmd = [ARGS.engine, "8", str(ARGS.bits), str(ARGS.bits)]
         proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-        # Stream stderr progress lines as SSE keepalive
+        # Send keepalive comments while engine runs
+        def send_keepalive():
+            while proc.poll() is None:
+                try:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                except Exception:
+                    break
+                time.sleep(2)
+
+        keepalive_thread = threading.Thread(target=send_keepalive, daemon=True)
+        keepalive_thread.start()
+
+        # Read stderr for progress (token count updates)
+        stderr_lines = []
         def read_stderr():
             for line in proc.stderr:
-                pass  # consume stderr silently
+                decoded = line.decode('utf-8', errors='replace').strip()
+                stderr_lines.append(decoded)
+                # Send progress via SSE
+                if '[t=' in decoded:
+                    try:
+                        self.wfile.write(f"data: .\n\n".encode())
+                        self.wfile.flush()
+                    except Exception:
+                        pass
 
-        t = threading.Thread(target=read_stderr, daemon=True)
-        t.start()
+        stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+        stderr_thread.start()
 
-        # Wait for process to finish, then decode and stream tokens
-        stdout, _ = proc.communicate(timeout=600)
+        try:
+            stdout, _ = proc.communicate(timeout=600)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout = b""
         output_text = stdout.decode('utf-8', errors='replace')
 
         try:
@@ -145,8 +177,9 @@ class Handler(BaseHTTPRequestHandler):
         # Parse output token IDs
         output_ids = []
         for line in output_text.split('\n'):
-            if line.startswith("Motore C Gemma4"):
-                parts = line.split(':')
+            stripped = line.strip()
+            if 'Motore C Gemma4' in stripped and ':' in stripped and '==' not in stripped:
+                parts = stripped.split(':')
                 if len(parts) >= 2:
                     for x in parts[-1].strip().split():
                         try:
@@ -169,11 +202,14 @@ class Handler(BaseHTTPRequestHandler):
                 decoded_so_far = new_text
                 if delta:
                     try:
-                        self.wfile.write(f"data: {delta}\n\n".encode())
+                        # SSE: newlines in data need separate "data:" lines
+                        # We encode \n as ␊ and decode in JS
+                        safe = delta.replace('\n', '␊')
+                        self.wfile.write(f"data: {safe}\n\n".encode())
                         self.wfile.flush()
                     except BrokenPipeError:
                         return
-                    time.sleep(0.02)  # slight delay for visual streaming
+                    time.sleep(0.02)
         else:
             self.wfile.write(b"data: [no output]\n\n")
             self.wfile.flush()
